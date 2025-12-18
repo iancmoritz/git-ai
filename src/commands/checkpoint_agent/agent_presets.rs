@@ -1037,6 +1037,405 @@ impl CursorPreset {
     }
 }
 
+// Windsurf to checkpoint preset
+pub struct WindsurfPreset;
+
+impl AgentCheckpointPreset for WindsurfPreset {
+    fn run(&self, flags: AgentCheckpointFlags) -> Result<AgentRunResult, GitAiError> {
+        // Parse hook_input JSON
+        // Windsurf hook data format:
+        // {
+        //   "agent_action_name": "string",
+        //   "trajectory_id": "string",
+        //   "execution_id": "string",
+        //   "timestamp": "string",
+        //   "tool_info": {}
+        // }
+        // Note: Unlike Cursor, Windsurf does NOT provide model, workspace_roots, or user_email
+        let hook_input_json = flags.hook_input.ok_or_else(|| {
+            GitAiError::PresetError("hook_input is required for Windsurf preset".to_string())
+        })?;
+
+        let hook_data: serde_json::Value = serde_json::from_str(&hook_input_json)
+            .map_err(|e| GitAiError::PresetError(format!("Invalid JSON in hook_input: {}", e)))?;
+
+        // Extract trajectory_id from the JSON
+        // Note: Windsurf uses "trajectory" terminology instead of "conversation"
+        let trajectory_id = hook_data
+            .get("trajectory_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                GitAiError::PresetError("trajectory_id not found in hook_input".to_string())
+            })?
+            .to_string();
+
+        // Extract agent_action_name (Windsurf's equivalent of hook_event_name)
+        let agent_action_name = hook_data
+            .get("agent_action_name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                GitAiError::PresetError("agent_action_name not found in hook_input".to_string())
+            })?
+            .to_string();
+
+        // Windsurf does not provide model in hook data - we'll extract it from the trajectory DB later
+        // For now, use "unknown" as placeholder
+        let model = "unknown".to_string();
+
+        // Validate agent_action_name
+        // Note: Windsurf uses different action names than Cursor:
+        // - "pre_user_prompt" for before user submits
+        // - "post_write_code" for after file edit
+        if agent_action_name != "pre_user_prompt" && agent_action_name != "post_write_code" {
+            return Err(GitAiError::PresetError(format!(
+                "Invalid agent_action_name: {}. Expected 'pre_user_prompt' or 'post_write_code'",
+                agent_action_name
+            )));
+        }
+
+        // Windsurf does not provide workspace_roots - use None and let caller determine from git context
+        let repo_working_dir: Option<String> = None;
+
+        if agent_action_name == "pre_user_prompt" {
+            // early return, we're just adding a human checkpoint.
+            return Ok(AgentRunResult {
+                agent_id: AgentId {
+                    tool: "windsurf".to_string(),
+                    id: trajectory_id.clone(),
+                    model: model.clone(),
+                },
+                agent_metadata: None,
+                checkpoint_kind: CheckpointKind::Human,
+                transcript: None,
+                repo_working_dir,
+                edited_filepaths: None,
+                will_edit_filepaths: None,
+                dirty_files: None,
+            });
+        }
+
+        // Locate Windsurf storage
+        let global_db = Self::windsurf_global_database_path()?;
+        if !global_db.exists() {
+            return Err(GitAiError::PresetError(format!(
+                "Windsurf global state database not found at {:?}. \
+                Make sure Windsurf is installed and has been used at least once. \
+                Expected location: {:?}",
+                global_db, global_db,
+            )));
+        }
+
+        // Fetch the trajectory data and extract transcript + model from DB
+        // (Windsurf doesn't provide model in hook data, so we get it from the trajectory)
+        let (transcript, db_model) = match Self::fetch_trajectory_payload(&global_db, &trajectory_id) {
+            Ok(payload) => Self::transcript_data_from_trajectory_payload(
+                &payload,
+                &global_db,
+                &trajectory_id,
+            )?
+            .unwrap_or_else(|| {
+                // Return empty transcript as default
+                // There's a race condition causing new threads to sometimes not show up.
+                // We refresh and grab all the messages in post-commit so we're ok with returning an empty (placeholder) transcript here and not throwing
+                eprintln!(
+                    "[Warning] Could not extract transcript from Windsurf trajectory. Retrying at commit."
+                );
+                (AiTranscript::new(), "unknown".to_string())
+            }),
+            Err(GitAiError::PresetError(msg))
+                if msg == "No trajectory data found in database" =>
+            {
+                // Gracefully continue when the trajectory hasn't been written yet due to race conditions
+                eprintln!(
+                    "[Warning] No trajectory data found in Windsurf DB for this thread. Proceeding and will re-sync at commit."
+                );
+                (AiTranscript::new(), "unknown".to_string())
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Extract edited filepaths from tool_info if available
+        let mut edited_filepaths: Option<Vec<String>> = None;
+        if let Some(tool_info) = hook_data.get("tool_info") {
+            // Try to extract file_path from tool_info
+            let file_path = tool_info
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !file_path.is_empty() {
+                edited_filepaths = Some(vec![file_path.to_string()]);
+            }
+        }
+
+        let agent_id = AgentId {
+            tool: "windsurf".to_string(),
+            id: trajectory_id,
+            model: db_model,
+        };
+
+        Ok(AgentRunResult {
+            agent_id,
+            agent_metadata: None,
+            checkpoint_kind: CheckpointKind::AiAgent,
+            transcript: Some(transcript),
+            repo_working_dir,
+            edited_filepaths,
+            will_edit_filepaths: None,
+            dirty_files: None,
+        })
+    }
+}
+
+impl WindsurfPreset {
+    /// Fetch the latest version of a Windsurf trajectory from the database
+    pub fn fetch_latest_windsurf_trajectory(
+        trajectory_id: &str,
+    ) -> Result<Option<(AiTranscript, String)>, GitAiError> {
+        let global_db = Self::windsurf_global_database_path()?;
+        if !global_db.exists() {
+            return Ok(None);
+        }
+
+        // Fetch trajectory payload
+        let trajectory_payload = Self::fetch_trajectory_payload(&global_db, trajectory_id)?;
+
+        // Extract transcript and model
+        let transcript_data = Self::transcript_data_from_trajectory_payload(
+            &trajectory_payload,
+            &global_db,
+            trajectory_id,
+        )?;
+
+        Ok(transcript_data)
+    }
+
+    // Get the Windsurf database path
+    fn windsurf_global_database_path() -> Result<PathBuf, GitAiError> {
+        if let Ok(global_db_path) = std::env::var("GIT_AI_WINDSURF_GLOBAL_DB_PATH") {
+            return Ok(PathBuf::from(global_db_path));
+        }
+        let user_dir = Self::windsurf_user_dir()?;
+        let global_db = user_dir.join("globalStorage").join("state.vscdb");
+        Ok(global_db)
+    }
+
+    fn windsurf_user_dir() -> Result<PathBuf, GitAiError> {
+        #[cfg(target_os = "windows")]
+        {
+            // Windows: %APPDATA%\Windsurf\User
+            let appdata = env::var("APPDATA")
+                .map_err(|e| GitAiError::Generic(format!("APPDATA not set: {}", e)))?;
+            Ok(Path::new(&appdata).join("Windsurf").join("User"))
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            // macOS: ~/Library/Application Support/Windsurf/User
+            let home = env::var("HOME")
+                .map_err(|e| GitAiError::Generic(format!("HOME not set: {}", e)))?;
+            Ok(Path::new(&home)
+                .join("Library")
+                .join("Application Support")
+                .join("Windsurf")
+                .join("User"))
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            // Linux: ~/.config/Windsurf/User
+            let home = env::var("HOME")
+                .map_err(|e| GitAiError::Generic(format!("HOME not set: {}", e)))?;
+            Ok(Path::new(&home)
+                .join(".config")
+                .join("Windsurf")
+                .join("User"))
+        }
+    }
+
+    fn open_sqlite_readonly(path: &Path) -> Result<Connection, GitAiError> {
+        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| GitAiError::Generic(format!("Failed to open {:?}: {}", path, e)))
+    }
+
+    pub fn fetch_trajectory_payload(
+        global_db_path: &Path,
+        trajectory_id: &str,
+    ) -> Result<serde_json::Value, GitAiError> {
+        let conn = Self::open_sqlite_readonly(global_db_path)?;
+
+        // Look for the trajectory data in cursorDiskKV (Windsurf uses same table name as Cursor)
+        let key_pattern = format!("composerData:{}", trajectory_id);
+        let mut stmt = conn
+            .prepare("SELECT value FROM cursorDiskKV WHERE key = ?")
+            .map_err(|e| GitAiError::Generic(format!("Query failed: {}", e)))?;
+
+        let mut rows = stmt
+            .query([&key_pattern])
+            .map_err(|e| GitAiError::Generic(format!("Query failed: {}", e)))?;
+
+        if let Ok(Some(row)) = rows.next() {
+            let value_text: String = row
+                .get(0)
+                .map_err(|e| GitAiError::Generic(format!("Failed to read value: {}", e)))?;
+
+            let data = serde_json::from_str::<serde_json::Value>(&value_text)
+                .map_err(|e| GitAiError::Generic(format!("Failed to parse JSON: {}", e)))?;
+
+            return Ok(data);
+        }
+
+        Err(GitAiError::PresetError(
+            "No trajectory data found in database".to_string(),
+        ))
+    }
+
+    pub fn transcript_data_from_trajectory_payload(
+        data: &serde_json::Value,
+        global_db_path: &Path,
+        trajectory_id: &str,
+    ) -> Result<Option<(AiTranscript, String)>, GitAiError> {
+        // Only support fullConversationHeadersOnly (bubbles format) - the current format
+        let conv = data
+            .get("fullConversationHeadersOnly")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                GitAiError::PresetError(
+                    "Trajectory uses unsupported legacy format. Only trajectories created after April 2025 are supported.".to_string()
+                )
+            })?;
+
+        let mut transcript = AiTranscript::new();
+        let mut model = None;
+
+        for header in conv.iter() {
+            if let Some(bubble_id) = header.get("bubbleId").and_then(|v| v.as_str()) {
+                if let Ok(Some(bubble_content)) =
+                    Self::fetch_bubble_content_from_db(global_db_path, trajectory_id, bubble_id)
+                {
+                    // Get bubble created at (ISO 8601 UTC string)
+                    let bubble_created_at = bubble_content
+                        .get("createdAt")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+
+                    // Extract model from bubble (first value wins)
+                    if model.is_none() {
+                        if let Some(model_info) = bubble_content.get("modelInfo") {
+                            if let Some(model_name) =
+                                model_info.get("modelName").and_then(|v| v.as_str())
+                            {
+                                model = Some(model_name.to_string());
+                            }
+                        }
+                    }
+
+                    // Extract text from bubble
+                    if let Some(text) = bubble_content.get("text").and_then(|v| v.as_str()) {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            let role = header.get("type").and_then(|v| v.as_i64()).unwrap_or(0);
+                            if role == 1 {
+                                transcript.add_message(Message::user(
+                                    trimmed.to_string(),
+                                    bubble_created_at.clone(),
+                                ));
+                            } else {
+                                transcript.add_message(Message::assistant(
+                                    trimmed.to_string(),
+                                    bubble_created_at.clone(),
+                                ));
+                            }
+                        }
+                    }
+
+                    // Handle tool calls and edits
+                    if let Some(tool_former_data) = bubble_content.get("toolFormerData") {
+                        let tool_name = tool_former_data
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let raw_args_str = tool_former_data
+                            .get("rawArgs")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("{}");
+                        let raw_args_json = serde_json::from_str::<serde_json::Value>(raw_args_str)
+                            .unwrap_or(serde_json::Value::Null);
+                        match tool_name {
+                            "edit_file" => {
+                                let target_file =
+                                    raw_args_json.get("target_file").and_then(|v| v.as_str());
+                                transcript.add_message(Message::tool_use(
+                                    tool_name.to_string(),
+                                    serde_json::json!({ "file_path": target_file.unwrap_or("") }),
+                                ));
+                            }
+                            "apply_patch"
+                            | "edit_file_v2_apply_patch"
+                            | "search_replace"
+                            | "edit_file_v2_search_replace"
+                            | "write"
+                            | "MultiEdit" => {
+                                let file_path =
+                                    raw_args_json.get("file_path").and_then(|v| v.as_str());
+                                transcript.add_message(Message::tool_use(
+                                    tool_name.to_string(),
+                                    serde_json::json!({ "file_path": file_path.unwrap_or("") }),
+                                ));
+                            }
+                            "codebase_search" | "grep" | "read_file" | "web_search"
+                            | "run_terminal_cmd" | "glob_file_search" | "todo_write"
+                            | "file_search" | "grep_search" | "list_dir" | "ripgrep" => {
+                                transcript.add_message(Message::tool_use(
+                                    tool_name.to_string(),
+                                    raw_args_json,
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        if !transcript.messages.is_empty() {
+            Ok(Some((transcript, model.unwrap_or("unknown".to_string()))))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn fetch_bubble_content_from_db(
+        global_db_path: &Path,
+        trajectory_id: &str,
+        bubble_id: &str,
+    ) -> Result<Option<serde_json::Value>, GitAiError> {
+        let conn = Self::open_sqlite_readonly(global_db_path)?;
+
+        // Look for bubble data in cursorDiskKV with pattern bubbleId:trajectoryId:bubbleId
+        let bubble_pattern = format!("bubbleId:{}:{}", trajectory_id, bubble_id);
+        let mut stmt = conn
+            .prepare("SELECT value FROM cursorDiskKV WHERE key = ?")
+            .map_err(|e| GitAiError::Generic(format!("Query failed: {}", e)))?;
+
+        let mut rows = stmt
+            .query([&bubble_pattern])
+            .map_err(|e| GitAiError::Generic(format!("Query failed: {}", e)))?;
+
+        if let Ok(Some(row)) = rows.next() {
+            let value_text: String = row
+                .get(0)
+                .map_err(|e| GitAiError::Generic(format!("Failed to read value: {}", e)))?;
+
+            let data = serde_json::from_str::<serde_json::Value>(&value_text)
+                .map_err(|e| GitAiError::Generic(format!("Failed to parse JSON: {}", e)))?;
+
+            return Ok(Some(data));
+        }
+
+        Ok(None)
+    }
+}
+
 pub struct GithubCopilotPreset;
 
 impl AgentCheckpointPreset for GithubCopilotPreset {

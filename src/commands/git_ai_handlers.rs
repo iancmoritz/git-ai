@@ -4,7 +4,7 @@ use crate::authorship::working_log::{AgentId, CheckpointKind};
 use crate::commands;
 use crate::commands::checkpoint_agent::agent_presets::{
     AgentCheckpointFlags, AgentCheckpointPreset, AgentRunResult, AiTabPreset, ClaudePreset,
-    ContinueCliPreset, CursorPreset, GeminiPreset, GithubCopilotPreset,
+    ContinueCliPreset, CursorPreset, GeminiPreset, GithubCopilotPreset, WindsurfPreset,
 };
 use crate::commands::checkpoint_agent::agent_v1_preset::AgentV1Preset;
 use crate::config;
@@ -268,6 +268,22 @@ fn handle_checkpoint(args: &[String]) {
                     }
                     Err(e) => {
                         eprintln!("Error running Cursor preset: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "windsurf" => {
+                match WindsurfPreset.run(AgentCheckpointFlags {
+                    hook_input: hook_input.clone(),
+                }) {
+                    Ok(agent_run) => {
+                        if agent_run.repo_working_dir.is_some() {
+                            repository_working_dir = agent_run.repo_working_dir.clone().unwrap();
+                        }
+                        agent_run_result = Some(agent_run);
+                    }
+                    Err(e) => {
+                        eprintln!("Error running Windsurf preset: {}", e);
                         std::process::exit(1);
                     }
                 }

@@ -5,6 +5,7 @@ use crate::authorship::virtual_attribution::VirtualAttributions;
 use crate::authorship::working_log::Checkpoint;
 use crate::commands::checkpoint_agent::agent_presets::{
     ClaudePreset, ContinueCliPreset, CursorPreset, GeminiPreset, GithubCopilotPreset,
+    WindsurfPreset,
 };
 use crate::config::Config;
 use crate::error::GitAiError;
@@ -175,6 +176,19 @@ fn update_prompts_to_latest(checkpoints: &mut [Checkpoint]) -> Result<(), GitAiE
             let updated_data = match agent_id.tool.as_str() {
                 "cursor" => {
                     let res = CursorPreset::fetch_latest_cursor_conversation(&agent_id.id);
+                    match res {
+                        Ok(Some((latest_transcript, latest_model))) => {
+                            Some((latest_transcript, latest_model))
+                        }
+                        Ok(None) => None,
+                        Err(_e) => {
+                            // TODO Log error to sentry
+                            None
+                        }
+                    }
+                }
+                "windsurf" => {
+                    let res = WindsurfPreset::fetch_latest_windsurf_trajectory(&agent_id.id);
                     match res {
                         Ok(Some((latest_transcript, latest_model))) => {
                             Some((latest_transcript, latest_model))
