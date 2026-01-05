@@ -1962,3 +1962,707 @@ impl AgentCheckpointPreset for AiTabPreset {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // ============================================================================
+    // WindsurfPreset Tests
+    // ============================================================================
+
+    fn create_windsurf_hook_input(
+        agent_action_name: &str,
+        trajectory_id: &str,
+        tool_info: Option<serde_json::Value>,
+    ) -> String {
+        let mut json = serde_json::json!({
+            "agent_action_name": agent_action_name,
+            "trajectory_id": trajectory_id,
+            "execution_id": "exec-123",
+            "timestamp": "2025-01-05T12:00:00Z"
+        });
+        if let Some(ti) = tool_info {
+            json.as_object_mut().unwrap().insert("tool_info".to_string(), ti);
+        }
+        serde_json::to_string(&json).unwrap()
+    }
+
+    #[test]
+    fn test_windsurf_pre_user_prompt_returns_human_checkpoint() {
+        let hook_input = create_windsurf_hook_input("pre_user_prompt", "traj-abc-123", None);
+        let flags = AgentCheckpointFlags {
+            hook_input: Some(hook_input),
+        };
+
+        let result = WindsurfPreset.run(flags).unwrap();
+
+        assert_eq!(result.checkpoint_kind, CheckpointKind::Human);
+        assert_eq!(result.agent_id.tool, "windsurf");
+        assert_eq!(result.agent_id.id, "traj-abc-123");
+        assert!(result.transcript.is_none());
+        assert!(result.repo_working_dir.is_none());
+    }
+
+    #[test]
+    fn test_windsurf_missing_hook_input_errors() {
+        let flags = AgentCheckpointFlags { hook_input: None };
+
+        let result = WindsurfPreset.run(flags);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("hook_input is required"),
+            "Expected 'hook_input is required' error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_windsurf_invalid_json_errors() {
+        let flags = AgentCheckpointFlags {
+            hook_input: Some("not valid json".to_string()),
+        };
+
+        let result = WindsurfPreset.run(flags);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid JSON"),
+            "Expected 'Invalid JSON' error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_windsurf_missing_trajectory_id_errors() {
+        let hook_input = serde_json::json!({
+            "agent_action_name": "pre_user_prompt",
+            "execution_id": "exec-123"
+        })
+        .to_string();
+
+        let flags = AgentCheckpointFlags {
+            hook_input: Some(hook_input),
+        };
+
+        let result = WindsurfPreset.run(flags);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("trajectory_id not found"),
+            "Expected 'trajectory_id not found' error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_windsurf_missing_agent_action_name_errors() {
+        let hook_input = serde_json::json!({
+            "trajectory_id": "traj-abc-123",
+            "execution_id": "exec-123"
+        })
+        .to_string();
+
+        let flags = AgentCheckpointFlags {
+            hook_input: Some(hook_input),
+        };
+
+        let result = WindsurfPreset.run(flags);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("agent_action_name not found"),
+            "Expected 'agent_action_name not found' error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_windsurf_invalid_agent_action_name_errors() {
+        let hook_input = serde_json::json!({
+            "agent_action_name": "invalid_action",
+            "trajectory_id": "traj-abc-123",
+            "execution_id": "exec-123"
+        })
+        .to_string();
+
+        let flags = AgentCheckpointFlags {
+            hook_input: Some(hook_input),
+        };
+
+        let result = WindsurfPreset.run(flags);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid agent_action_name"),
+            "Expected 'Invalid agent_action_name' error, got: {}",
+            err
+        );
+        assert!(
+            err.to_string()
+                .contains("Expected 'pre_user_prompt' or 'post_write_code'"),
+            "Expected hint about valid values, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_windsurf_db_path_env_override() {
+        // This test verifies that the env var override mechanism works.
+        // We use a unique path that we can verify was used.
+        let temp_dir = TempDir::new().unwrap();
+        let unique_marker = format!("windsurf_test_marker_{}", std::process::id());
+        let custom_db_path = temp_dir.path().join(&unique_marker).join("custom_state.vscdb");
+
+        // Set the env var
+        // SAFETY: This is test code running in isolation
+        unsafe {
+            std::env::set_var("GIT_AI_WINDSURF_GLOBAL_DB_PATH", &custom_db_path);
+        }
+
+        let result = WindsurfPreset::windsurf_global_database_path();
+
+        // Clean up env var
+        // SAFETY: This is test code running in isolation
+        unsafe {
+            std::env::remove_var("GIT_AI_WINDSURF_GLOBAL_DB_PATH");
+        }
+
+        assert!(result.is_ok());
+        let result_path = result.unwrap();
+        // Verify the result contains our unique marker, proving the env var was used
+        assert!(
+            result_path.to_string_lossy().contains(&unique_marker),
+            "Expected path to contain unique marker '{}', got: {:?}",
+            unique_marker,
+            result_path
+        );
+    }
+
+    #[test]
+    fn test_windsurf_post_write_code_without_db_errors() {
+        // Ensure env var is not set to a valid path
+        // SAFETY: This is test code running in isolation
+        unsafe {
+            std::env::remove_var("GIT_AI_WINDSURF_GLOBAL_DB_PATH");
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let nonexistent_db = temp_dir.path().join("nonexistent.vscdb");
+        // SAFETY: This is test code running in isolation
+        unsafe {
+            std::env::set_var("GIT_AI_WINDSURF_GLOBAL_DB_PATH", &nonexistent_db);
+        }
+
+        let hook_input = create_windsurf_hook_input("post_write_code", "traj-abc-123", None);
+        let flags = AgentCheckpointFlags {
+            hook_input: Some(hook_input),
+        };
+
+        let result = WindsurfPreset.run(flags);
+
+        // Clean up
+        // SAFETY: This is test code running in isolation
+        unsafe {
+            std::env::remove_var("GIT_AI_WINDSURF_GLOBAL_DB_PATH");
+        }
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("not found"),
+            "Expected 'not found' error for missing DB, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_windsurf_fetch_latest_trajectory_missing_db_returns_none() {
+        let temp_dir = TempDir::new().unwrap();
+        let nonexistent_db = temp_dir.path().join("nonexistent.vscdb");
+        // SAFETY: This is test code running in isolation
+        unsafe {
+            std::env::set_var("GIT_AI_WINDSURF_GLOBAL_DB_PATH", &nonexistent_db);
+        }
+
+        let result = WindsurfPreset::fetch_latest_windsurf_trajectory("traj-abc-123");
+
+        // Clean up
+        // SAFETY: This is test code running in isolation
+        unsafe {
+            std::env::remove_var("GIT_AI_WINDSURF_GLOBAL_DB_PATH");
+        }
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    // Test with a real SQLite database fixture
+    #[test]
+    fn test_windsurf_transcript_extraction_from_db() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_state.vscdb");
+
+        // Create a test database with sample data
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+
+        let trajectory_id = "test-traj-001";
+
+        // Insert trajectory data with fullConversationHeadersOnly format
+        let trajectory_data = serde_json::json!({
+            "fullConversationHeadersOnly": [
+                {"bubbleId": "bubble-1", "type": 1},
+                {"bubbleId": "bubble-2", "type": 2}
+            ]
+        });
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            [
+                format!("composerData:{}", trajectory_id),
+                trajectory_data.to_string(),
+            ],
+        )
+        .unwrap();
+
+        // Insert bubble data for user message
+        let user_bubble = serde_json::json!({
+            "text": "Hello, can you help me?",
+            "createdAt": "2025-01-05T12:00:00Z"
+        });
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            [
+                format!("bubbleId:{}:bubble-1", trajectory_id),
+                user_bubble.to_string(),
+            ],
+        )
+        .unwrap();
+
+        // Insert bubble data for assistant message with model info
+        let assistant_bubble = serde_json::json!({
+            "text": "Sure, I can help you with that!",
+            "createdAt": "2025-01-05T12:00:05Z",
+            "modelInfo": {
+                "modelName": "claude-3-5-sonnet"
+            }
+        });
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            [
+                format!("bubbleId:{}:bubble-2", trajectory_id),
+                assistant_bubble.to_string(),
+            ],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Set env var to use our test database
+        // SAFETY: This is test code running in isolation
+        unsafe {
+            std::env::set_var("GIT_AI_WINDSURF_GLOBAL_DB_PATH", &db_path);
+        }
+
+        let result = WindsurfPreset::fetch_latest_windsurf_trajectory(trajectory_id);
+
+        // Clean up
+        // SAFETY: This is test code running in isolation
+        unsafe {
+            std::env::remove_var("GIT_AI_WINDSURF_GLOBAL_DB_PATH");
+        }
+
+        assert!(result.is_ok());
+        let (transcript, model) = result.unwrap().unwrap();
+
+        assert_eq!(model, "claude-3-5-sonnet");
+        assert_eq!(transcript.messages.len(), 2);
+
+        // Verify user message
+        match &transcript.messages[0] {
+            Message::User { text, .. } => {
+                assert_eq!(text, "Hello, can you help me?");
+            }
+            _ => panic!("Expected User message"),
+        }
+
+        // Verify assistant message
+        match &transcript.messages[1] {
+            Message::Assistant { text, .. } => {
+                assert_eq!(text, "Sure, I can help you with that!");
+            }
+            _ => panic!("Expected Assistant message"),
+        }
+    }
+
+    #[test]
+    fn test_windsurf_post_write_code_with_db_returns_ai_agent_checkpoint() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_state.vscdb");
+
+        // Create a test database with sample data
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+
+        let trajectory_id = "test-traj-002";
+
+        // Insert trajectory data
+        let trajectory_data = serde_json::json!({
+            "fullConversationHeadersOnly": [
+                {"bubbleId": "bubble-1", "type": 1}
+            ]
+        });
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            [
+                format!("composerData:{}", trajectory_id),
+                trajectory_data.to_string(),
+            ],
+        )
+        .unwrap();
+
+        // Insert bubble data
+        let user_bubble = serde_json::json!({
+            "text": "Edit the file",
+            "createdAt": "2025-01-05T12:00:00Z",
+            "modelInfo": {
+                "modelName": "gpt-4o"
+            }
+        });
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            [
+                format!("bubbleId:{}:bubble-1", trajectory_id),
+                user_bubble.to_string(),
+            ],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Set env var to use our test database
+        // SAFETY: This is test code running in isolation
+        unsafe {
+            std::env::set_var("GIT_AI_WINDSURF_GLOBAL_DB_PATH", &db_path);
+        }
+
+        let hook_input = create_windsurf_hook_input(
+            "post_write_code",
+            trajectory_id,
+            Some(serde_json::json!({"file_path": "/path/to/edited/file.rs"})),
+        );
+        let flags = AgentCheckpointFlags {
+            hook_input: Some(hook_input),
+        };
+
+        let result = WindsurfPreset.run(flags);
+
+        // Clean up
+        // SAFETY: This is test code running in isolation
+        unsafe {
+            std::env::remove_var("GIT_AI_WINDSURF_GLOBAL_DB_PATH");
+        }
+
+        assert!(result.is_ok());
+        let run_result = result.unwrap();
+
+        assert_eq!(run_result.checkpoint_kind, CheckpointKind::AiAgent);
+        assert_eq!(run_result.agent_id.tool, "windsurf");
+        assert_eq!(run_result.agent_id.id, trajectory_id);
+        assert_eq!(run_result.agent_id.model, "gpt-4o");
+        assert!(run_result.transcript.is_some());
+        assert_eq!(
+            run_result.edited_filepaths,
+            Some(vec!["/path/to/edited/file.rs".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_windsurf_extracts_edited_filepath_from_tool_info() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_state.vscdb");
+
+        // Create minimal test database
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+
+        let trajectory_id = "test-traj-003";
+        let trajectory_data = serde_json::json!({
+            "fullConversationHeadersOnly": []
+        });
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            [
+                format!("composerData:{}", trajectory_id),
+                trajectory_data.to_string(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        // SAFETY: This is test code running in isolation
+        unsafe {
+            std::env::set_var("GIT_AI_WINDSURF_GLOBAL_DB_PATH", &db_path);
+        }
+
+        let hook_input = create_windsurf_hook_input(
+            "post_write_code",
+            trajectory_id,
+            Some(serde_json::json!({"file_path": "/src/main.rs"})),
+        );
+        let flags = AgentCheckpointFlags {
+            hook_input: Some(hook_input),
+        };
+
+        let result = WindsurfPreset.run(flags);
+
+        // SAFETY: This is test code running in isolation
+        unsafe {
+            std::env::remove_var("GIT_AI_WINDSURF_GLOBAL_DB_PATH");
+        }
+
+        assert!(result.is_ok());
+        let run_result = result.unwrap();
+        assert_eq!(
+            run_result.edited_filepaths,
+            Some(vec!["/src/main.rs".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_windsurf_empty_tool_info_file_path_not_added() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_state.vscdb");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+
+        let trajectory_id = "test-traj-004";
+        let trajectory_data = serde_json::json!({
+            "fullConversationHeadersOnly": []
+        });
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            [
+                format!("composerData:{}", trajectory_id),
+                trajectory_data.to_string(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        // SAFETY: This is test code running in isolation
+        unsafe {
+            std::env::set_var("GIT_AI_WINDSURF_GLOBAL_DB_PATH", &db_path);
+        }
+
+        // Empty file_path should not be added
+        let hook_input = create_windsurf_hook_input(
+            "post_write_code",
+            trajectory_id,
+            Some(serde_json::json!({"file_path": ""})),
+        );
+        let flags = AgentCheckpointFlags {
+            hook_input: Some(hook_input),
+        };
+
+        let result = WindsurfPreset.run(flags);
+
+        // SAFETY: This is test code running in isolation
+        unsafe {
+            std::env::remove_var("GIT_AI_WINDSURF_GLOBAL_DB_PATH");
+        }
+
+        assert!(result.is_ok());
+        let run_result = result.unwrap();
+        assert!(run_result.edited_filepaths.is_none());
+    }
+
+    #[test]
+    fn test_windsurf_tool_calls_in_transcript() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_state.vscdb");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+
+        let trajectory_id = "test-traj-005";
+
+        // Trajectory with tool call bubble
+        let trajectory_data = serde_json::json!({
+            "fullConversationHeadersOnly": [
+                {"bubbleId": "bubble-tool", "type": 2}
+            ]
+        });
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            [
+                format!("composerData:{}", trajectory_id),
+                trajectory_data.to_string(),
+            ],
+        )
+        .unwrap();
+
+        // Bubble with toolFormerData for edit_file
+        let tool_bubble = serde_json::json!({
+            "text": "",
+            "createdAt": "2025-01-05T12:00:00Z",
+            "modelInfo": {"modelName": "claude-3-5-sonnet"},
+            "toolFormerData": {
+                "name": "edit_file",
+                "rawArgs": "{\"target_file\": \"/src/lib.rs\"}"
+            }
+        });
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            [
+                format!("bubbleId:{}:bubble-tool", trajectory_id),
+                tool_bubble.to_string(),
+            ],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // SAFETY: This is test code running in isolation
+        unsafe {
+            std::env::set_var("GIT_AI_WINDSURF_GLOBAL_DB_PATH", &db_path);
+        }
+
+        let result = WindsurfPreset::fetch_latest_windsurf_trajectory(trajectory_id);
+
+        // SAFETY: This is test code running in isolation
+        unsafe {
+            std::env::remove_var("GIT_AI_WINDSURF_GLOBAL_DB_PATH");
+        }
+
+        assert!(result.is_ok());
+        let (transcript, _model) = result.unwrap().unwrap();
+
+        // Should have the tool use message
+        assert_eq!(transcript.messages.len(), 1);
+        match &transcript.messages[0] {
+            Message::ToolUse { name, input, .. } => {
+                assert_eq!(name, "edit_file");
+                assert_eq!(input.get("file_path").unwrap().as_str().unwrap(), "/src/lib.rs");
+            }
+            _ => panic!("Expected ToolUse message, got {:?}", transcript.messages[0]),
+        }
+    }
+
+    #[test]
+    fn test_windsurf_legacy_format_errors() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_state.vscdb");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+
+        let trajectory_id = "test-traj-legacy";
+
+        // Legacy format without fullConversationHeadersOnly
+        let trajectory_data = serde_json::json!({
+            "conversation": [
+                {"role": "user", "content": "Hello"}
+            ]
+        });
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            [
+                format!("composerData:{}", trajectory_id),
+                trajectory_data.to_string(),
+            ],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // SAFETY: This is test code running in isolation
+        unsafe {
+            std::env::set_var("GIT_AI_WINDSURF_GLOBAL_DB_PATH", &db_path);
+        }
+
+        // Fetch trajectory payload first
+        let payload = WindsurfPreset::fetch_trajectory_payload(&db_path, trajectory_id).unwrap();
+        let result =
+            WindsurfPreset::transcript_data_from_trajectory_payload(&payload, &db_path, trajectory_id);
+
+        // SAFETY: This is test code running in isolation
+        unsafe {
+            std::env::remove_var("GIT_AI_WINDSURF_GLOBAL_DB_PATH");
+        }
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported legacy format"),
+            "Expected legacy format error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_windsurf_no_trajectory_data_in_db() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_state.vscdb");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // SAFETY: This is test code running in isolation
+        unsafe {
+            std::env::set_var("GIT_AI_WINDSURF_GLOBAL_DB_PATH", &db_path);
+        }
+
+        let result = WindsurfPreset::fetch_trajectory_payload(&db_path, "nonexistent-traj");
+
+        // SAFETY: This is test code running in isolation
+        unsafe {
+            std::env::remove_var("GIT_AI_WINDSURF_GLOBAL_DB_PATH");
+        }
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("No trajectory data found"),
+            "Expected 'No trajectory data found' error, got: {}",
+            err
+        );
+    }
+}
