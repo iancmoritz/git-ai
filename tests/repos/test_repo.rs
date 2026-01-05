@@ -21,6 +21,7 @@ pub struct TestRepo {
     path: PathBuf,
     pub feature_flags: FeatureFlags,
     pub(crate) config_patch: Option<ConfigPatch>,
+    test_db_path: PathBuf,
 }
 
 impl TestRepo {
@@ -29,6 +30,8 @@ impl TestRepo {
         let n: u64 = rng.gen_range(0..10000000000);
         let base = std::env::temp_dir();
         let path = base.join(n.to_string());
+        // Create DB path as sibling to repo (not inside) to avoid git conflicts with WAL files
+        let test_db_path = base.join(format!("{}-db", n));
         let repo = Repository::init(&path).expect("failed to initialize git2 repository");
         let mut config = Repository::config(&repo).expect("failed to initialize git2 repository");
         config
@@ -38,14 +41,108 @@ impl TestRepo {
             .set_str("user.email", "test@example.com")
             .expect("failed to initialize git2 repository");
 
-        Self {
+        let mut repo = Self {
             path,
             feature_flags: FeatureFlags::default(),
             config_patch: None,
+            test_db_path,
+        };
+
+        repo.patch_git_ai_config(|patch| {
+            patch.exclude_prompts_in_repositories = Some(vec![]); // No exclusions = share everywhere
+            patch.prompt_storage = Some("notes".to_string()); // Use notes mode for tests
+        });
+
+        repo
+    }
+
+    /// Create a pair of test repos: a local mirror and its upstream remote.
+    /// The mirror is cloned from the upstream, so "origin" is automatically configured.
+    /// Returns (mirror, upstream) tuple.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let (mirror, upstream) = TestRepo::new_with_remote();
+    ///
+    /// // Make changes in mirror
+    /// mirror.filename("test.txt").write("hello").stage();
+    /// mirror.commit("initial commit");
+    ///
+    /// // Push to upstream
+    /// mirror.git(&["push", "origin", "main"]);
+    /// ```
+    pub fn new_with_remote() -> (Self, Self) {
+        let mut rng = rand::thread_rng();
+        let base = std::env::temp_dir();
+
+        // Create bare upstream repository (acts as the remote server)
+        let upstream_n: u64 = rng.gen_range(0..10000000000);
+        let upstream_path = base.join(upstream_n.to_string());
+        // Create DB path as sibling to repo (not inside) to avoid git conflicts with WAL files
+        let upstream_test_db_path = base.join(format!("{}-db", upstream_n));
+        Repository::init_bare(&upstream_path).expect("failed to init bare upstream repository");
+
+        let upstream = Self {
+            path: upstream_path.clone(),
+            feature_flags: FeatureFlags::default(),
+            config_patch: None,
+            test_db_path: upstream_test_db_path,
+        };
+
+        // Clone upstream to create mirror with origin configured
+        let mirror_n: u64 = rng.gen_range(0..10000000000);
+        let mirror_path = base.join(mirror_n.to_string());
+        // Create DB path as sibling to repo (not inside) to avoid git conflicts with WAL files
+        let mirror_test_db_path = base.join(format!("{}-db", mirror_n));
+
+        let clone_output = Command::new("git")
+            .args([
+                "clone",
+                upstream_path.to_str().unwrap(),
+                mirror_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("failed to clone upstream repository");
+
+        if !clone_output.status.success() {
+            panic!(
+                "Failed to clone upstream repository:\nstderr: {}",
+                String::from_utf8_lossy(&clone_output.stderr)
+            );
         }
+
+        // Configure mirror with user credentials
+        let mirror_repo =
+            Repository::open(&mirror_path).expect("failed to open cloned mirror repository");
+        let mut config =
+            Repository::config(&mirror_repo).expect("failed to get mirror repository config");
+        config
+            .set_str("user.name", "Test User")
+            .expect("failed to set user.name in mirror");
+        config
+            .set_str("user.email", "test@example.com")
+            .expect("failed to set user.email in mirror");
+
+        let mut mirror = Self {
+            path: mirror_path,
+            feature_flags: FeatureFlags::default(),
+            config_patch: None,
+            test_db_path: mirror_test_db_path,
+        };
+
+        mirror.patch_git_ai_config(|patch| {
+            patch.exclude_prompts_in_repositories = Some(vec![]); // No exclusions = share everywhere
+            patch.prompt_storage = Some("notes".to_string()); // Use notes mode for tests
+        });
+
+        (mirror, upstream)
     }
 
     pub fn new_at_path(path: &PathBuf) -> Self {
+        // Create DB path as sibling to repo (not inside) to avoid git conflicts with WAL files
+        let mut rng = rand::thread_rng();
+        let db_n: u64 = rng.gen_range(0..10000000000);
+        let test_db_path = std::env::temp_dir().join(format!("{}-db", db_n));
         let repo = Repository::init(path).expect("failed to initialize git2 repository");
         let mut config = Repository::config(&repo).expect("failed to initialize git2 repository");
         config
@@ -58,6 +155,7 @@ impl TestRepo {
             path: path.clone(),
             feature_flags: FeatureFlags::default(),
             config_patch: None,
+            test_db_path,
         }
     }
 
@@ -94,6 +192,10 @@ impl TestRepo {
         self.path
             .canonicalize()
             .expect("failed to canonicalize test repo path")
+    }
+
+    pub fn test_db_path(&self) -> &PathBuf {
+        &self.test_db_path
     }
 
     pub fn stats(&self) -> Result<CommitStats, String> {
@@ -232,6 +334,9 @@ impl TestRepo {
             }
         }
 
+        // Add test database path for isolation
+        command.env("GIT_AI_TEST_DB_PATH", self.test_db_path.to_str().unwrap());
+
         // Add custom environment variables
         for (key, value) in envs {
             command.env(key, value);
@@ -273,6 +378,9 @@ impl TestRepo {
             }
         }
 
+        // Add test database path for isolation
+        command.env("GIT_AI_TEST_DB_PATH", self.test_db_path.to_str().unwrap());
+
         // Add custom environment variables
         for (key, value) in envs {
             command.env(key, value);
@@ -281,6 +389,61 @@ impl TestRepo {
         let output = command
             .output()
             .expect(&format!("Failed to execute git-ai command: {:?}", args));
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        if output.status.success() {
+            // Combine stdout and stderr since git-ai often writes to stderr
+            let combined = if stdout.is_empty() {
+                stderr
+            } else if stderr.is_empty() {
+                stdout
+            } else {
+                format!("{}{}", stdout, stderr)
+            };
+            Ok(combined)
+        } else {
+            Err(stderr)
+        }
+    }
+
+    /// Run a git-ai command with data provided on stdin
+    pub fn git_ai_with_stdin(&self, args: &[&str], stdin_data: &[u8]) -> Result<String, String> {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let binary_path = get_binary_path();
+
+        let mut command = Command::new(binary_path);
+        command
+            .args(args)
+            .current_dir(&self.path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        // Add config patch as environment variable if present
+        if let Some(patch) = &self.config_patch {
+            if let Ok(patch_json) = serde_json::to_string(patch) {
+                command.env("GIT_AI_TEST_CONFIG_PATCH", patch_json);
+            }
+        }
+
+        let mut child = command
+            .spawn()
+            .expect(&format!("Failed to spawn git-ai command: {:?}", args));
+
+        // Write stdin data
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(stdin_data)
+                .expect("Failed to write to stdin");
+        }
+
+        let output = child
+            .wait_with_output()
+            .expect(&format!("Failed to wait for git-ai command: {:?}", args));
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -398,6 +561,8 @@ impl TestRepo {
 impl Drop for TestRepo {
     fn drop(&mut self) {
         fs::remove_dir_all(self.path.clone()).expect("failed to remove test repo");
+        // Also clean up the test database directory (may not exist if no DB operations were done)
+        let _ = fs::remove_dir_all(self.test_db_path.clone());
     }
 }
 

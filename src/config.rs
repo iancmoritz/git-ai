@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use dirs;
 
 use glob::Pattern;
 use serde::{Deserialize, Serialize};
@@ -12,10 +13,12 @@ use crate::git::repository::Repository;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::RwLock;
 
-/// Centralized configuration for the application
+/// Default API base URL for comparison
+pub const DEFAULT_API_BASE_URL: &str = "https://usegitai.com";
+
 pub struct Config {
     git_path: String,
-    ignore_prompts: bool,
+    exclude_prompts_in_repositories: Vec<Pattern>,
     allow_repositories: Vec<Pattern>,
     exclude_repositories: Vec<Pattern>,
     telemetry_oss_disabled: bool,
@@ -24,6 +27,8 @@ pub struct Config {
     disable_auto_updates: bool,
     update_channel: UpdateChannel,
     feature_flags: FeatureFlags,
+    api_base_url: String,
+    prompt_storage: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,28 +59,32 @@ impl Default for UpdateChannel {
         UpdateChannel::Latest
     }
 }
-#[derive(Deserialize)]
-struct FileConfig {
-    #[serde(default)]
-    git_path: Option<String>,
-    #[serde(default)]
-    ignore_prompts: Option<bool>,
-    #[serde(default)]
-    allow_repositories: Option<Vec<String>>,
-    #[serde(default)]
-    exclude_repositories: Option<Vec<String>>,
-    #[serde(default)]
-    telemetry_oss: Option<String>,
-    #[serde(default)]
-    telemetry_enterprise_dsn: Option<String>,
-    #[serde(default)]
-    disable_version_checks: Option<bool>,
-    #[serde(default)]
-    disable_auto_updates: Option<bool>,
-    #[serde(default)]
-    update_channel: Option<String>,
-    #[serde(default)]
-    feature_flags: Option<serde_json::Value>,
+#[derive(Deserialize, Serialize, Default)]
+pub struct FileConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_prompts_in_repositories: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_repositories: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_repositories: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_oss: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_enterprise_dsn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_version_checks: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_auto_updates: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feature_flags: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_storage: Option<String>,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -89,13 +98,15 @@ static TEST_FEATURE_FLAGS_OVERRIDE: RwLock<Option<FeatureFlags>> = RwLock::new(N
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConfigPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ignore_prompts: Option<bool>,
+    pub exclude_prompts_in_repositories: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry_oss_disabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disable_version_checks: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disable_auto_updates: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_storage: Option<String>,
 }
 
 impl Config {
@@ -116,17 +127,20 @@ impl Config {
         &self.git_path
     }
 
-    #[allow(dead_code)]
-    pub fn get_ignore_prompts(&self) -> bool {
-        self.ignore_prompts
+    pub fn is_allowed_repository(&self, repository: &Option<Repository>) -> bool {
+        // Fetch remotes once and reuse for both exclude and allow checks
+        let remotes = repository
+            .as_ref()
+            .and_then(|repo| repo.remotes_with_urls().ok());
+
+        self.is_allowed_repository_with_remotes(remotes.as_ref())
     }
 
-    pub fn is_allowed_repository(&self, repository: &Option<Repository>) -> bool {
+    /// Helper that accepts pre-fetched remotes to avoid multiple git operations
+    fn is_allowed_repository_with_remotes(&self, remotes: Option<&Vec<(String, String)>>) -> bool {
         // First check if repository is in exclusion list - exclusions take precedence
-        if !self.exclude_repositories.is_empty()
-            && let Some(repository) = repository
-        {
-            if let Some(remotes) = repository.remotes_with_urls().ok() {
+        if !self.exclude_repositories.is_empty() {
+            if let Some(remotes) = remotes {
                 // If any remote matches the exclusion patterns, deny access
                 if remotes.iter().any(|remote| {
                     self.exclude_repositories
@@ -144,24 +158,55 @@ impl Config {
         }
 
         // If allowlist is defined, only allow repos whose remotes match the patterns
-        if let Some(repository) = repository {
-            match repository.remotes_with_urls().ok() {
-                Some(remotes) => remotes.iter().any(|remote| {
-                    self.allow_repositories
-                        .iter()
-                        .any(|pattern| pattern.matches(&remote.1))
-                }),
-                None => false, // Can't verify, deny by default when allowlist is active
-            }
-        } else {
-            false // No repository provided, deny by default when allowlist is active
+        match remotes {
+            Some(remotes) => remotes.iter().any(|remote| {
+                self.allow_repositories
+                    .iter()
+                    .any(|pattern| pattern.matches(&remote.1))
+            }),
+            None => false, // Can't verify, deny by default when allowlist is active
         }
     }
 
-    /// Returns whether prompts should be ignored (currently unused by internal APIs).
-    #[allow(dead_code)]
-    pub fn ignore_prompts(&self) -> bool {
-        self.ignore_prompts
+    /// Returns true if prompts should be excluded (not shared) for the given repository.
+    /// This uses a blacklist model: empty list = share everywhere, patterns = repos to exclude.
+    /// Local repositories (no remotes) are only excluded if wildcard "*" pattern is present.
+    pub fn should_exclude_prompts(&self, repository: &Option<Repository>) -> bool {
+        // Empty exclusion list = never exclude
+        if self.exclude_prompts_in_repositories.is_empty() {
+            return false;
+        }
+
+        // Check for wildcard "*" pattern - excludes ALL repos including local
+        let has_wildcard = self
+            .exclude_prompts_in_repositories
+            .iter()
+            .any(|pattern| pattern.as_str() == "*");
+        if has_wildcard {
+            return true;
+        }
+
+        // Fetch remotes
+        let remotes = repository
+            .as_ref()
+            .and_then(|repo| repo.remotes_with_urls().ok());
+
+        match remotes {
+            Some(remotes) => {
+                if remotes.is_empty() {
+                    // No remotes = local-only repo, not excluded (unless wildcard, handled above)
+                    false
+                } else {
+                    // Has remotes - check if any match exclusion patterns
+                    remotes.iter().any(|remote| {
+                        self.exclude_prompts_in_repositories
+                            .iter()
+                            .any(|pattern| pattern.matches(&remote.1))
+                    })
+                }
+            }
+            None => false, // Can't get remotes = don't exclude
+        }
     }
 
     /// Returns true if OSS telemetry is disabled.
@@ -188,6 +233,19 @@ impl Config {
 
     pub fn feature_flags(&self) -> &FeatureFlags {
         &self.feature_flags
+    }
+
+    /// Returns the API base URL
+    pub fn api_base_url(&self) -> &str {
+        &self.api_base_url
+    }
+
+    /// Returns the prompt storage mode: "default", "notes", or "local"
+    /// - "default": Messages uploaded via CAS API
+    /// - "notes": Messages stored in git notes
+    /// - "local": Messages only stored in sqlite (not in notes, not uploaded)
+    pub fn prompt_storage(&self) -> &str {
+        &self.prompt_storage
     }
 
     /// Override feature flags for testing purposes.
@@ -233,10 +291,22 @@ impl Config {
 
 fn build_config() -> Config {
     let file_cfg = load_file_config();
-    let ignore_prompts = file_cfg
+    let exclude_prompts_in_repositories = file_cfg
         .as_ref()
-        .and_then(|c| c.ignore_prompts)
-        .unwrap_or(false);
+        .and_then(|c| c.exclude_prompts_in_repositories.clone())
+        .unwrap_or(vec![])
+        .into_iter()
+        .filter_map(|pattern_str| {
+            Pattern::new(&pattern_str)
+                .map_err(|e| {
+                    eprintln!(
+                        "Warning: Invalid glob pattern in exclude_prompts_in_repositories '{}': {}",
+                        pattern_str, e
+                    );
+                })
+                .ok()
+        })
+        .collect();
     let allow_repositories = file_cfg
         .as_ref()
         .and_then(|c| c.allow_repositories.clone())
@@ -303,11 +373,35 @@ fn build_config() -> Config {
     // Build feature flags from file config
     let feature_flags = build_feature_flags(&file_cfg);
 
+    // Get API base URL from config, env var, or default
+    let api_base_url = file_cfg
+        .as_ref()
+        .and_then(|c| c.api_base_url.clone())
+        .or_else(|| env::var("GIT_AI_API_BASE_URL").ok())
+        .unwrap_or_else(|| DEFAULT_API_BASE_URL.to_string());
+
+    // Get prompt_storage setting (defaults to "default")
+    // Valid values: "default", "notes", "local"
+    let prompt_storage = file_cfg
+        .as_ref()
+        .and_then(|c| c.prompt_storage.clone())
+        .unwrap_or_else(|| "default".to_string());
+    let prompt_storage = match prompt_storage.as_str() {
+        "default" | "notes" | "local" => prompt_storage,
+        other => {
+            eprintln!(
+                "Warning: Invalid prompt_storage value '{}', using 'default'",
+                other
+            );
+            "default".to_string()
+        }
+    };
+
     #[cfg(any(test, feature = "test-support"))]
     {
         let mut config = Config {
             git_path,
-            ignore_prompts,
+            exclude_prompts_in_repositories,
             allow_repositories,
             exclude_repositories,
             telemetry_oss_disabled,
@@ -316,6 +410,8 @@ fn build_config() -> Config {
             disable_auto_updates,
             update_channel,
             feature_flags,
+            api_base_url,
+            prompt_storage,
         };
         apply_test_config_patch(&mut config);
         config
@@ -324,7 +420,7 @@ fn build_config() -> Config {
     #[cfg(not(any(test, feature = "test-support")))]
     Config {
         git_path,
-        ignore_prompts,
+        exclude_prompts_in_repositories,
         allow_repositories,
         exclude_repositories,
         telemetry_oss_disabled,
@@ -333,6 +429,8 @@ fn build_config() -> Config {
         disable_auto_updates,
         update_channel,
         feature_flags,
+        api_base_url,
+        prompt_storage,
     }
 }
 
@@ -400,16 +498,71 @@ fn load_file_config() -> Option<FileConfig> {
 }
 
 fn config_file_path() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    Some(home.join(".git-ai").join("config.json"))
+}
+
+/// Public accessor for config file path
+pub fn config_file_path_public() -> Option<PathBuf> {
+    config_file_path()
+}
+
+/// Returns the path to the internal state directory (~/.git-ai/internal)
+/// This is where git-ai stores internal files like distinct_id, update_check, etc.
+pub fn internal_dir_path() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         let home = env::var("USERPROFILE").ok()?;
-        Some(Path::new(&home).join(".git-ai").join("config.json"))
+        Some(Path::new(&home).join(".git-ai").join("internal"))
     }
     #[cfg(not(windows))]
     {
         let home = env::var("HOME").ok()?;
-        Some(Path::new(&home).join(".git-ai").join("config.json"))
+        Some(Path::new(&home).join(".git-ai").join("internal"))
     }
+}
+
+/// Public accessor for ID file path (~/.git-ai/internal/distinct_id)
+pub fn id_file_path() -> Option<PathBuf> {
+    internal_dir_path().map(|dir| dir.join("distinct_id"))
+}
+
+/// Returns the path to the update check cache file (~/.git-ai/internal/update_check)
+pub fn update_check_path() -> Option<PathBuf> {
+    internal_dir_path().map(|dir| dir.join("update_check"))
+}
+
+/// Load the raw file config
+pub fn load_file_config_public() -> Result<FileConfig, String> {
+    let path =
+        config_file_path().ok_or_else(|| "Could not determine config file path".to_string())?;
+
+    if !path.exists() {
+        // Return empty config if file doesn't exist
+        return Ok(FileConfig::default());
+    }
+
+    let data = fs::read(&path).map_err(|e| format!("Failed to read config file: {}", e))?;
+
+    serde_json::from_slice::<FileConfig>(&data)
+        .map_err(|e| format!("Failed to parse config file: {}", e))
+}
+
+/// Save the file config
+pub fn save_file_config(config: &FileConfig) -> Result<(), String> {
+    let path =
+        config_file_path().ok_or_else(|| "Could not determine config file path".to_string())?;
+
+    // Ensure the directory exists
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create config directory: {}", e))?;
+    }
+
+    let json = serde_json::to_string_pretty(config)
+        .map_err(|e| format!("Failed to serialize config: {}", e))?;
+
+    fs::write(&path, json).map_err(|e| format!("Failed to write config file: {}", e))
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -427,8 +580,20 @@ fn is_executable(path: &Path) -> bool {
 fn apply_test_config_patch(config: &mut Config) {
     if let Ok(patch_json) = env::var("GIT_AI_TEST_CONFIG_PATCH") {
         if let Ok(patch) = serde_json::from_str::<ConfigPatch>(&patch_json) {
-            if let Some(ignore_prompts) = patch.ignore_prompts {
-                config.ignore_prompts = ignore_prompts;
+            if let Some(patterns) = patch.exclude_prompts_in_repositories {
+                config.exclude_prompts_in_repositories = patterns
+                    .into_iter()
+                    .filter_map(|pattern_str| {
+                        Pattern::new(&pattern_str)
+                            .map_err(|e| {
+                                eprintln!(
+                                    "Warning: Invalid test pattern in exclude_prompts_in_repositories '{}': {}",
+                                    pattern_str, e
+                                );
+                            })
+                            .ok()
+                    })
+                    .collect();
             }
             if let Some(telemetry_oss_disabled) = patch.telemetry_oss_disabled {
                 config.telemetry_oss_disabled = telemetry_oss_disabled;
@@ -438,6 +603,17 @@ fn apply_test_config_patch(config: &mut Config) {
             }
             if let Some(disable_auto_updates) = patch.disable_auto_updates {
                 config.disable_auto_updates = disable_auto_updates;
+            }
+            if let Some(prompt_storage) = patch.prompt_storage {
+                // Validate the value
+                if matches!(prompt_storage.as_str(), "default" | "notes" | "local") {
+                    config.prompt_storage = prompt_storage;
+                } else {
+                    eprintln!(
+                        "Warning: Invalid test prompt_storage value '{}', ignoring",
+                        prompt_storage
+                    );
+                }
             }
         }
     }
@@ -453,7 +629,7 @@ mod tests {
     ) -> Config {
         Config {
             git_path: "/usr/bin/git".to_string(),
-            ignore_prompts: false,
+            exclude_prompts_in_repositories: vec![],
             allow_repositories: allow_repositories
                 .into_iter()
                 .filter_map(|s| Pattern::new(&s).ok())
@@ -468,6 +644,8 @@ mod tests {
             disable_auto_updates: false,
             update_channel: UpdateChannel::Latest,
             feature_flags: FeatureFlags::default(),
+            api_base_url: DEFAULT_API_BASE_URL.to_string(),
+            prompt_storage: "default".to_string(),
         }
     }
 
@@ -550,5 +728,98 @@ mod tests {
         assert!(config.allow_repositories[0].matches("git@github.com:company/repo"));
         assert!(config.allow_repositories[0].matches("user@github.com:company/project"));
         assert!(!config.allow_repositories[0].matches("git@github.com:other/repo"));
+    }
+
+    // Tests for exclude_prompts_in_repositories (blacklist)
+
+    fn create_test_config_with_exclude_prompts(exclude_prompts_patterns: Vec<String>) -> Config {
+        Config {
+            git_path: "/usr/bin/git".to_string(),
+            exclude_prompts_in_repositories: exclude_prompts_patterns
+                .into_iter()
+                .filter_map(|s| Pattern::new(&s).ok())
+                .collect(),
+            allow_repositories: vec![],
+            exclude_repositories: vec![],
+            telemetry_oss_disabled: false,
+            telemetry_enterprise_dsn: None,
+            disable_version_checks: false,
+            disable_auto_updates: false,
+            update_channel: UpdateChannel::Latest,
+            feature_flags: FeatureFlags::default(),
+            api_base_url: DEFAULT_API_BASE_URL.to_string(),
+            prompt_storage: "default".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_should_exclude_prompts_empty_patterns_returns_false() {
+        let config = create_test_config_with_exclude_prompts(vec![]);
+
+        // Empty patterns = share everywhere (blacklist model)
+        assert!(!config.should_exclude_prompts(&None));
+    }
+
+    #[test]
+    fn test_should_exclude_prompts_no_repository_returns_false() {
+        let config =
+            create_test_config_with_exclude_prompts(vec!["https://github.com/*".to_string()]);
+
+        // Even with patterns, no repository provided = don't exclude (can't verify)
+        assert!(!config.should_exclude_prompts(&None));
+    }
+
+    #[test]
+    fn test_should_exclude_prompts_pattern_matching() {
+        let config =
+            create_test_config_with_exclude_prompts(vec!["https://github.com/myorg/*".to_string()]);
+
+        // Test that pattern is compiled correctly
+        assert!(!config.exclude_prompts_in_repositories.is_empty());
+        assert!(config.exclude_prompts_in_repositories[0].matches("https://github.com/myorg/repo1"));
+        assert!(config.exclude_prompts_in_repositories[0].matches("https://github.com/myorg/repo2"));
+        assert!(!config.exclude_prompts_in_repositories[0].matches("https://github.com/other/repo"));
+    }
+
+    #[test]
+    fn test_should_exclude_prompts_wildcard_all() {
+        let config = create_test_config_with_exclude_prompts(vec!["*".to_string()]);
+
+        // Wildcard * should match any remote URL pattern (exclude all)
+        assert!(!config.exclude_prompts_in_repositories.is_empty());
+        assert!(config.exclude_prompts_in_repositories[0].matches("https://github.com/any/repo"));
+        assert!(config.exclude_prompts_in_repositories[0].matches("git@gitlab.com:any/project"));
+
+        // Wildcard * should also exclude repos without remotes (None case)
+        assert!(config.should_exclude_prompts(&None));
+    }
+
+    #[test]
+    fn test_should_exclude_prompts_local_repo_not_excluded_without_wildcard() {
+        // Test 1: Local repo with no patterns configured - never excluded
+        let config_no_patterns = create_test_config_with_exclude_prompts(vec![]);
+        assert!(!config_no_patterns.should_exclude_prompts(&None));
+
+        // Test 2: Local repo with non-wildcard patterns - not excluded
+        // (patterns only match against remotes, local repos have none)
+        let config_with_patterns =
+            create_test_config_with_exclude_prompts(vec!["https://github.com/*".to_string()]);
+        assert!(
+            config_with_patterns.exclude_prompts_in_repositories[0]
+                .matches("https://github.com/myorg/repo")
+        );
+        // Non-wildcard patterns should NOT exclude repos without remotes
+        assert!(!config_with_patterns.should_exclude_prompts(&None));
+    }
+
+    #[test]
+    fn test_should_exclude_prompts_respects_patterns_when_remotes_exist() {
+        let config =
+            create_test_config_with_exclude_prompts(vec!["https://github.com/private/*".to_string()]);
+
+        // Pattern should match private repos (to exclude)
+        assert!(config.exclude_prompts_in_repositories[0].matches("https://github.com/private/repo"));
+        // Pattern should not match other repos
+        assert!(!config.exclude_prompts_in_repositories[0].matches("https://github.com/public/repo"));
     }
 }

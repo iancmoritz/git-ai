@@ -1,4 +1,5 @@
 use crate::config::{self, UpdateChannel};
+use crate::observability::log_message;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::IsTerminal;
@@ -14,12 +15,10 @@ use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const UPDATE_CHECK_INTERVAL_HOURS: u64 = 24;
-const INSTALL_SCRIPT_URL: &str =
-    "https://raw.githubusercontent.com/acunniffe/git-ai/main/install.sh";
+const INSTALL_SCRIPT_URL: &str = "https://usegitai.com/install.sh";
 #[cfg(windows)]
 const INSTALL_SCRIPT_PS1_URL: &str =
     "https://raw.githubusercontent.com/acunniffe/git-ai/main/install.ps1";
-const RELEASES_API_URL: &str = "https://usegitai.com/api/releases";
 const GIT_AI_RELEASE_ENV: &str = "GIT_AI_RELEASE_TAG";
 const BACKGROUND_SPAWN_THROTTLE_SECS: u64 = 60;
 
@@ -32,6 +31,17 @@ enum UpgradeAction {
     AlreadyLatest,
     RunningNewerVersion,
     ForceReinstall,
+}
+
+impl UpgradeAction {
+    fn to_string(&self) -> &str {
+        match self {
+            UpgradeAction::UpgradeAvailable => "upgrade_available",
+            UpgradeAction::AlreadyLatest => "already_latest",
+            UpgradeAction::RunningNewerVersion => "running_newer_version",
+            UpgradeAction::ForceReinstall => "force_reinstall",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -77,11 +87,11 @@ fn get_update_check_cache_path() -> Option<PathBuf> {
     #[cfg(test)]
     {
         if let Ok(test_cache_dir) = std::env::var("GIT_AI_TEST_CACHE_DIR") {
-            return Some(PathBuf::from(test_cache_dir).join(".update_check"));
+            return Some(PathBuf::from(test_cache_dir).join("update_check"));
         }
     }
 
-    dirs::home_dir().map(|home| home.join(".git-ai").join(".update_check"))
+    crate::config::update_check_path()
 }
 
 fn read_update_cache() -> Option<UpdateCache> {
@@ -156,13 +166,12 @@ fn persist_update_state(channel: UpdateChannel, release: Option<&ChannelRelease>
     write_update_cache(&cache);
 }
 
-fn releases_endpoint(base: Option<&str>) -> String {
-    base.map(|b| format!("{}/releases", b.trim_end_matches('/')))
-        .unwrap_or_else(|| RELEASES_API_URL.to_string())
+fn releases_endpoint(base: &str) -> String {
+    format!("{}/api/releases", base.trim_end_matches('/'))
 }
 
 fn fetch_release_for_channel(
-    api_base_url: Option<&str>,
+    api_base_url: &str,
     channel: UpdateChannel,
 ) -> Result<ChannelRelease, String> {
     #[cfg(test)]
@@ -211,10 +220,9 @@ fn release_from_response(
 
 #[cfg(test)]
 fn try_mock_releases(
-    api_base_url: Option<&str>,
+    base: &str,
     channel: UpdateChannel,
 ) -> Option<Result<ChannelRelease, String>> {
-    let base = api_base_url?;
     let json = base.strip_prefix("mock://")?;
     Some(
         serde_json::from_str::<ReleasesResponse>(json)
@@ -352,12 +360,12 @@ fn run_impl(force: bool, background: bool) {
     let config = config::Config::get();
     let channel = config.update_channel();
     let skip_install = background && config.auto_updates_disabled();
-    let _ = run_impl_with_url(force, None, channel, skip_install);
+    let _ = run_impl_with_url(force, config.api_base_url(), channel, skip_install);
 }
 
 fn run_impl_with_url(
     force: bool,
-    api_base_url: Option<&str>,
+    api_base_url: &str,
     channel: UpdateChannel,
     skip_install: bool,
 ) -> UpgradeAction {
@@ -385,6 +393,17 @@ fn run_impl_with_url(
     let action = determine_action(force, &release, current_version);
     let cache_release = matches!(action, UpgradeAction::UpgradeAvailable);
     persist_update_state(channel, cache_release.then_some(&release));
+
+    log_message(
+        "checked_for_update",
+        "info",
+        Some(serde_json::json!({
+            "current_version": current_version,
+            "api_base_url": api_base_url,
+            "channel": channel.as_str(),
+            "result": action.to_string()
+        })),
+    );
 
     match action {
         UpgradeAction::AlreadyLatest => {
@@ -414,7 +433,7 @@ fn run_impl_with_url(
     }
     println!();
 
-    if api_base_url.is_some() || skip_install {
+    if skip_install {
         return action;
     }
 
@@ -428,6 +447,17 @@ fn run_impl_with_url(
             {
                 println!("\x1b[1;32m✓\x1b[0m Successfully installed {}!", release.tag);
             }
+
+            log_message(
+                "upgraded",
+                "info",
+                Some(serde_json::json!({
+                    "release_tag": release.tag,
+                    "current_version": current_version,
+                    "api_base_url": api_base_url,
+                    "channel": channel.as_str()
+                })),
+            );
         }
         Err(err) => {
             eprintln!("{}", err);
@@ -595,11 +625,11 @@ mod tests {
         // Newer version available - should upgrade
         let action = run_impl_with_url(
             false,
-            Some(&mock_url(
+            &mock_url(
                 r#"{"latest":"v999.0.0","next":"v999.0.0-next-deadbeef"}"#,
-            )),
+            ),
             UpdateChannel::Latest,
-            false,
+            true,
         );
         assert_eq!(action, UpgradeAction::UpgradeAvailable);
 
@@ -610,40 +640,40 @@ mod tests {
         );
         let action = run_impl_with_url(
             false,
-            Some(&mock_url(&same_version_payload)),
+            &mock_url(&same_version_payload),
             UpdateChannel::Latest,
-            false,
+            true,
         );
         assert_eq!(action, UpgradeAction::AlreadyLatest);
 
         // Same version with --force - force reinstall
         let action = run_impl_with_url(
             true,
-            Some(&mock_url(&same_version_payload)),
+            &mock_url(&same_version_payload),
             UpdateChannel::Latest,
-            false,
+            true,
         );
         assert_eq!(action, UpgradeAction::ForceReinstall);
 
         // Older version without --force - running newer version
         let action = run_impl_with_url(
             false,
-            Some(&mock_url(
+            &mock_url(
                 r#"{"latest":"v1.0.9","next":"v1.0.9-next-deadbeef"}"#,
-            )),
+            ),
             UpdateChannel::Latest,
-            false,
+            true,
         );
         assert_eq!(action, UpgradeAction::RunningNewerVersion);
 
         // Older version with --force - force reinstall
         let action = run_impl_with_url(
             true,
-            Some(&mock_url(
+            &mock_url(
                 r#"{"latest":"v1.0.9","next":"v1.0.9-next-deadbeef"}"#,
-            )),
+            ),
             UpdateChannel::Latest,
-            false,
+            true,
         );
         assert_eq!(action, UpgradeAction::ForceReinstall);
 

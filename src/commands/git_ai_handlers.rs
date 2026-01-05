@@ -1,3 +1,6 @@
+use serde_json::json;
+
+use crate::authorship::internal_db::InternalDatabase;
 use crate::authorship::range_authorship;
 use crate::authorship::stats::stats_command;
 use crate::authorship::working_log::{AgentId, CheckpointKind};
@@ -11,8 +14,9 @@ use crate::config;
 use crate::git::find_repository;
 use crate::git::find_repository_in_path;
 use crate::git::repository::CommitRange;
-use crate::observability;
 use crate::observability::wrapper_performance_targets::log_performance_for_checkpoint;
+use crate::observability::{self, log_message};
+use crate::utils::is_interactive_terminal;
 use std::env;
 use std::io::IsTerminal;
 use std::io::Read;
@@ -36,6 +40,14 @@ pub fn handle_git_ai(args: &[String]) {
 
     let allowed_repository = config.is_allowed_repository(&repository_option);
 
+    // Start DB warmup early for commands that need database access
+    match args[0].as_str() {
+        "checkpoint" | "show-prompt" | "share" | "sync-prompts" | "flush-cas" => {
+            InternalDatabase::warmup();
+        }
+        _ => {}
+    }
+
     match args[0].as_str() {
         "help" | "--help" | "-h" => {
             print_help();
@@ -48,7 +60,16 @@ pub fn handle_git_ai(args: &[String]) {
             }
             std::process::exit(0);
         }
+        "config" => {
+            commands::config::handle_config(&args[1..]);
+            if is_interactive_terminal() {
+                log_message("config", "info", None)
+            }
+        }
         "stats" => {
+            if is_interactive_terminal() {
+                log_message("stats", "info", None)
+            }
             handle_stats(&args[1..]);
         }
         "show" => {
@@ -65,21 +86,32 @@ pub fn handle_git_ai(args: &[String]) {
         }
         "blame" => {
             handle_ai_blame(&args[1..]);
+            if is_interactive_terminal() {
+                log_message("blame", "info", None)
+            }
         }
         "diff" => {
             handle_ai_diff(&args[1..]);
+            if is_interactive_terminal() {
+                log_message("diff", "info", None)
+            }
         }
         "git-path" => {
             let config = config::Config::get();
             println!("{}", config.git_cmd());
             std::process::exit(0);
         }
-        "install-hooks" => {
-            if let Err(e) = commands::install_hooks::run(&args[1..]) {
+        "install-hooks" => match commands::install_hooks::run(&args[1..]) {
+            Ok(statuses) => {
+                if let Ok(statuses_value) = serde_json::to_value(&statuses) {
+                    log_message("install-hooks", "info", Some(statuses_value));
+                }
+            }
+            Err(e) => {
                 eprintln!("Install hooks failed: {}", e);
                 std::process::exit(1);
             }
-        }
+        },
         "squash-authorship" => {
             commands::squash_authorship::handle_squash_authorship(&args[1..]);
         }
@@ -92,8 +124,17 @@ pub fn handle_git_ai(args: &[String]) {
         "flush-logs" => {
             commands::flush_logs::handle_flush_logs(&args[1..]);
         }
+        "flush-cas" => {
+            commands::flush_cas::handle_flush_cas(&args[1..]);
+        }
         "show-prompt" => {
             commands::show_prompt::handle_show_prompt(&args[1..]);
+        }
+        "share" => {
+            commands::share::handle_share(&args[1..]);
+        }
+        "sync-prompts" => {
+            commands::sync_prompts::handle_sync_prompts(&args[1..]);
         }
         #[cfg(debug_assertions)]
         "show-transcript" => {
@@ -132,6 +173,18 @@ fn print_help() {
     eprintln!(
         "    --offset <n>          Skip n occurrences (0 = most recent, mutually exclusive with --commit)"
     );
+    eprintln!("  share <id>         Share a prompt by creating a bundle");
+    eprintln!("    --title <title>       Custom title for the bundle (default: auto-generated)");
+    eprintln!("  sync-prompts       Update prompts in database to latest versions");
+    eprintln!("    --since <time>        Only sync prompts updated after this time");
+    eprintln!("                          Formats: '1d', '2h', '1w', Unix timestamp, ISO8601, YYYY-MM-DD");
+    eprintln!("    --workdir <path>      Only sync prompts from specific repository");
+    eprintln!("  config             View and manage git-ai configuration");
+    eprintln!("                        Show all config as formatted JSON");
+    eprintln!("    <key>                 Show specific config value (supports dot notation)");
+    eprintln!("    set <key> <value>     Set a config value (arrays: single value = [value])");
+    eprintln!("    --add <key> <value>   Add to array or upsert into object");
+    eprintln!("    unset <key>           Remove config value (reverts to default)");
     eprintln!("  install-hooks      Install git hooks for AI authorship tracking");
     eprintln!("  ci                 Continuous integration utilities");
     eprintln!("    github                 GitHub CI helpers");
@@ -683,34 +736,31 @@ fn handle_show_transcript(args: &[String]) {
     let agent_name = &args[0];
     let path_or_id = &args[1];
 
-    let result: Result<(crate::authorship::transcript::AiTranscript, Option<String>), crate::error::GitAiError> = match agent_name.as_str() {
-        "claude" => {
-            match ClaudePreset::transcript_and_model_from_claude_code_jsonl(path_or_id) {
-                Ok((transcript, model)) => Ok((transcript, model)),
-                Err(e) => {
-                    eprintln!("Error loading Claude transcript: {}", e);
-                    std::process::exit(1);
-                }
+    let result: Result<
+        (crate::authorship::transcript::AiTranscript, Option<String>),
+        crate::error::GitAiError,
+    > = match agent_name.as_str() {
+        "claude" => match ClaudePreset::transcript_and_model_from_claude_code_jsonl(path_or_id) {
+            Ok((transcript, model)) => Ok((transcript, model)),
+            Err(e) => {
+                eprintln!("Error loading Claude transcript: {}", e);
+                std::process::exit(1);
             }
-        }
-        "gemini" => {
-            match GeminiPreset::transcript_and_model_from_gemini_json(path_or_id) {
-                Ok((transcript, model)) => Ok((transcript, model)),
-                Err(e) => {
-                    eprintln!("Error loading Gemini transcript: {}", e);
-                    std::process::exit(1);
-                }
+        },
+        "gemini" => match GeminiPreset::transcript_and_model_from_gemini_json(path_or_id) {
+            Ok((transcript, model)) => Ok((transcript, model)),
+            Err(e) => {
+                eprintln!("Error loading Gemini transcript: {}", e);
+                std::process::exit(1);
             }
-        }
-        "continue-cli" => {
-            match ContinueCliPreset::transcript_from_continue_json(path_or_id) {
-                Ok(transcript) => Ok((transcript, None)),
-                Err(e) => {
-                    eprintln!("Error loading Continue CLI transcript: {}", e);
-                    std::process::exit(1);
-                }
+        },
+        "continue-cli" => match ContinueCliPreset::transcript_from_continue_json(path_or_id) {
+            Ok(transcript) => Ok((transcript, None)),
+            Err(e) => {
+                eprintln!("Error loading Continue CLI transcript: {}", e);
+                std::process::exit(1);
             }
-        }
+        },
         "github-copilot" => {
             match GithubCopilotPreset::transcript_and_model_from_copilot_session_json(path_or_id) {
                 Ok((transcript, model, _file_paths)) => Ok((transcript, model)),
@@ -720,19 +770,17 @@ fn handle_show_transcript(args: &[String]) {
                 }
             }
         }
-        "cursor" => {
-            match CursorPreset::fetch_latest_cursor_conversation(path_or_id) {
-                Ok(Some((transcript, model))) => Ok((transcript, Some(model))),
-                Ok(None) => {
-                    eprintln!("Error: Conversation not found or database not available");
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("Error loading Cursor transcript: {}", e);
-                    std::process::exit(1);
-                }
+        "cursor" => match CursorPreset::fetch_latest_cursor_conversation(path_or_id) {
+            Ok(Some((transcript, model))) => Ok((transcript, Some(model))),
+            Ok(None) => {
+                eprintln!("Error: Conversation not found or database not available");
+                std::process::exit(1);
             }
-        }
+            Err(e) => {
+                eprintln!("Error loading Cursor transcript: {}", e);
+                std::process::exit(1);
+            }
+        },
         _ => {
             eprintln!("Error: Unknown agent '{}'", agent_name);
             eprintln!("Supported agents: claude, gemini, continue-cli, github-copilot, cursor");

@@ -15,13 +15,13 @@
 #### Mac, Linux, Windows (WSL)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/acunniffe/git-ai/main/install.sh | bash
+curl -sSL https://usegitai.com/install.sh | bash
 ```
 
 #### Windows (non-WSL)
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/acunniffe/git-ai/main/install.ps1 | iex"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://usegitai.com/install.ps1 | iex"
 ```
 
 🎊 That's it! **No per-repo setup.** Once installed Git AI will work OOTB with any of these **Supported Agents**:
@@ -52,6 +52,26 @@ A PR Bot aggregates `git-ai` data at the PR, Repository and Organization levels:
 
 ![alt](https://github.com/acunniffe/git-ai/raw/main/assets/docs/bot.jpg)
 
+## Prompt Storage
+By default Git AI stores prompt data locally only. To include prompts in git notes (authorship logs), set `prompt_storage` to `notes`:
+
+```bash
+git-ai config set prompt_storage notes
+```
+
+When using notes mode, you can exclude specific repositories from having prompt data included:
+
+```bash
+git-ai config set --add exclude_prompts_in_repositories https://github.com/private-org/*
+git-ai config set --add exclude_prompts_in_repositories /path/to/private/repo
+```
+
+*or to exclude all repositories:*
+
+```bash
+git-ai config set --add exclude_prompts_in_repositories "*"
+```
+
 ## Goals of `git-ai` project
 
 🤖 **Track AI code in a Multi-Agent** world. Because developers get to choose their tools, engineering teams need a **vendor agnostic** way to track AI impact in their repos.
@@ -64,7 +84,7 @@ A PR Bot aggregates `git-ai` data at the PR, Repository and Organization levels:
 
 🚀 **Git-native + Fast** - `git-ai` is built on git plumbing commands. Negligible impact even in large repos (&lt;100ms). Tested in [Chromium](https://github.com/chromium/chromium).
 
-## Documentation
+## [Documentation](https://usegitai.com/docs)
 
 - How Git AI Works and its Limitations [▶️ Video](https://www.youtube.com/watch?v=b_DZTC1PKHI) [🗺️ Diagram](https://usegitai.com/docs/how-git-ai-works)
 - [Git AI Commands](https://usegitai.com/docs/reference)
@@ -76,21 +96,23 @@ A PR Bot aggregates `git-ai` data at the PR, Repository and Organization levels:
 
 | Agent/IDE                                                                                  | Authorship | Prompts |
 | ------------------------------------------------------------------------------------------ | ---------- | ------- |
-| [Cursor &gt;1.7](https://usegitai.com/docs/cursor)                                         | ✅         | ✅      |
-| [Claude Code](https://usegitai.com/docs/claude-code)                                       | ✅         | ✅      |
-| [GitHub Copilot in VSCode via Extension](https://usegitai.com/docs/vs-code-github-copilot) | ✅         | ✅      |
-| Google Gemini CLI (in nightly, GA coming soon)                                             | ✅         | ✅      |
+| Cursor &gt;1.7                                                                             | ✅         | ✅      |
+| Claude Code                                                                                | ✅         | ✅      |
+| GitHub Copilot in VSCode via Extension                                                     | ✅         | ✅      |
+| Google Gemini CLI                                                                          | ✅         | ✅      |
+| Continue CLI                                                                               | ✅         | ✅      |
 | OpenCode                                                                                   | ✅         | ✅      |
 | Atlassian RovoDev CLI                                                                      | ✅         | ✅      |
 | AWS Kiro (in-progress)                                                                     | 🔄         | 🔄      |
-| Continue CLI (in-progress)                                                                 | 🔄         | 🔄      |
 | Continue VS Code/IntelliJ (in-progress)                                                    | 🔄         | 🔄      |
+| Windsurf                                                                                   | 🔄         | 🔄      |
+| Augment Code                                                                               | 🔄         | 🔄      |
 | OpenAI Codex (waiting on [openai/codex #2109](https://github.com/openai/codex/issues/2109)) |            |         |
 | Junie &amp; Jetbrains IDEs                                                                 |            |         |
 | Ona                                                                                        |            |         |
 | Sourcegraph Cody + Amp                                                                     |            |         |
 | Google Antigravity                                                                         |            |         |
-| Windsurf                                                                                   |            |         |
+
 | _your agent here_                                                                          |            |         |
 
 > **Building a Coding Agent?** [Add support for Git AI by following this guide](https://usegitai.com/docs/add-your-agent)
