@@ -1368,12 +1368,14 @@ fn install_windsurf_hooks(binary_path: &Path, dry_run: bool) -> Result<Option<St
         "hooks": {
             "pre_user_prompt": [
                 {
-                    "command": before_submit_cmd
+                    "command": before_submit_cmd,
+                    "show_output": true
                 }
             ],
             "post_write_code": [
                 {
-                    "command": after_edit_cmd
+                    "command": after_edit_cmd,
+                    "show_output": true
                 }
             ]
         }
