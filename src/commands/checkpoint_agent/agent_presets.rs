@@ -1063,15 +1063,14 @@ pub struct WindsurfPreset;
 impl AgentCheckpointPreset for WindsurfPreset {
     fn run(&self, flags: AgentCheckpointFlags) -> Result<AgentRunResult, GitAiError> {
         // Parse hook_input JSON
-        // Windsurf hook data format:
+        // Windsurf hook data general fields (https://docs.windsurf.com/windsurf/cascade/hooks#common-input-structure)
         // {
         //   "agent_action_name": "string",
         //   "trajectory_id": "string",
         //   "execution_id": "string",
         //   "timestamp": "string",
-        //   "tool_info": {}
+        //   "tool_info": {...} (depends on agent_action_name)
         // }
-        // Note: Unlike Cursor, Windsurf does NOT provide model, workspace_roots, or user_email
         let hook_input_json = flags.hook_input.ok_or_else(|| {
             GitAiError::PresetError("hook_input is required for Windsurf preset".to_string())
         })?;
@@ -1116,13 +1115,13 @@ impl AgentCheckpointPreset for WindsurfPreset {
         // Windsurf does not provide workspace_roots - use None and let caller determine from git context
         let repo_working_dir: Option<String> = None;
 
-        // Extract filepaths from tool_info.file_path (used for both will_edit and edited)
-        let filepaths = hook_data
+        // Extract filepath from tool_info.file_path (used for both will_edit and edited)
+        let filepath = hook_data
             .get("tool_info")
             .and_then(|ti| ti.get("file_path"))
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .map(|s| vec![s.to_string()]);
+            .map(|s| s.to_string());
 
         let agent_id = AgentId {
             tool: "windsurf".to_string(),
@@ -1138,7 +1137,7 @@ impl AgentCheckpointPreset for WindsurfPreset {
                 transcript: None,
                 repo_working_dir,
                 edited_filepaths: None,
-                will_edit_filepaths: filepaths,
+                will_edit_filepaths: filepath.map(|f| vec![f]),
                 dirty_files: None,
             });
         }
@@ -1149,7 +1148,7 @@ impl AgentCheckpointPreset for WindsurfPreset {
             checkpoint_kind: CheckpointKind::AiAgent,
             transcript: None,
             repo_working_dir,
-            edited_filepaths: filepaths,
+            edited_filepaths: filepath.map(|f| vec![f]),
             will_edit_filepaths: None,
             dirty_files: None,
         })
