@@ -61,7 +61,7 @@ const CURSOR_BEFORE_SUBMIT_CMD: &str = "checkpoint cursor --hook-input stdin";
 const CURSOR_AFTER_EDIT_CMD: &str = "checkpoint cursor --hook-input stdin";
 
 // Windsurf hooks (requires absolute path to avoid shell config loading delay)
-const WINDSURF_BEFORE_SUBMIT_CMD: &str = "checkpoint windsurf --hook-input stdin";
+const WINDSURF_BEFORE_EDIT_CMD: &str = "checkpoint windsurf --hook-input stdin";
 const WINDSURF_AFTER_EDIT_CMD: &str = "checkpoint windsurf --hook-input stdin";
 
 // OpenCode plugin content (TypeScript), embedded from the source file to avoid drift
@@ -1357,18 +1357,18 @@ fn install_windsurf_hooks(binary_path: &Path, dry_run: bool) -> Result<Option<St
     };
 
     // Build commands with absolute path
-    let before_submit_cmd = format!("{} {}", binary_path.display(), WINDSURF_BEFORE_SUBMIT_CMD);
+    let before_edit_cmd = format!("{} {}", binary_path.display(), WINDSURF_BEFORE_EDIT_CMD);
     let after_edit_cmd = format!("{} {}", binary_path.display(), WINDSURF_AFTER_EDIT_CMD);
 
     // Desired hooks payload for Windsurf with hook names
     // Note: Windsurf uses different hook names than Cursor:
-    // - "pre_user_prompt" instead of "beforeSubmitPrompt"
+    // - "pre_write_code" instead of "beforeSubmitPrompt"
     // - "post_write_code" instead of "afterFileEdit"
     let desired: Value = json!({
         "hooks": {
-            "pre_user_prompt": [
+            "pre_write_code": [
                 {
-                    "command": before_submit_cmd,
+                    "command": before_edit_cmd,
                     "show_output": true
                 }
             ],
@@ -1388,7 +1388,7 @@ fn install_windsurf_hooks(binary_path: &Path, dry_run: bool) -> Result<Option<St
     let mut hooks_obj = merged.get("hooks").cloned().unwrap_or_else(|| json!({}));
 
     // Process both hook types (Windsurf uses different names than Cursor)
-    for hook_name in &["pre_user_prompt", "post_write_code"] {
+    for hook_name in &["pre_write_code", "post_write_code"] {
         let desired_hooks = desired
             .get("hooks")
             .and_then(|h| h.get(*hook_name))
@@ -3584,15 +3584,15 @@ mod tests {
         }
 
         // Build expected commands
-        let before_submit_cmd = format!("{} {}", binary_path.display(), WINDSURF_BEFORE_SUBMIT_CMD);
+        let before_edit_cmd = format!("{} {}", binary_path.display(), WINDSURF_BEFORE_EDIT_CMD);
         let after_edit_cmd = format!("{} {}", binary_path.display(), WINDSURF_AFTER_EDIT_CMD);
 
         // Create the expected structure (simulating install_windsurf_hooks)
         let result = json!({
             "hooks": {
-                "pre_user_prompt": [
+                "pre_write_code": [
                     {
-                        "command": before_submit_cmd.clone()
+                        "command": before_edit_cmd.clone()
                     }
                 ],
                 "post_write_code": [
@@ -3613,13 +3613,13 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
 
         let hooks = content.get("hooks").unwrap();
-        let pre_user_prompt = hooks.get("pre_user_prompt").unwrap().as_array().unwrap();
+        let pre_write_code = hooks.get("pre_write_code").unwrap().as_array().unwrap();
         let post_write_code = hooks.get("post_write_code").unwrap().as_array().unwrap();
 
-        assert_eq!(pre_user_prompt.len(), 1);
+        assert_eq!(pre_write_code.len(), 1);
         assert_eq!(post_write_code.len(), 1);
         assert!(
-            pre_user_prompt[0]
+            pre_write_code[0]
                 .get("command")
                 .unwrap()
                 .as_str()
@@ -3649,7 +3649,7 @@ mod tests {
         // Create existing hooks file with other commands
         let existing = json!({
             "hooks": {
-                "pre_user_prompt": [
+                "pre_write_code": [
                     {
                         "command": "echo 'before'"
                     }
@@ -3668,12 +3668,12 @@ mod tests {
         .unwrap();
 
         // Simulate merging (like install_windsurf_hooks does)
-        let git_ai_cmd = format!("{} {}", binary_path.display(), WINDSURF_BEFORE_SUBMIT_CMD);
+        let git_ai_cmd = format!("{} {}", binary_path.display(), WINDSURF_BEFORE_EDIT_CMD);
 
         let mut content: Value =
             serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
 
-        for hook_name in &["pre_user_prompt", "post_write_code"] {
+        for hook_name in &["pre_write_code", "post_write_code"] {
             let hooks_obj = content.get_mut("hooks").unwrap();
             let mut hooks_array = hooks_obj
                 .get(*hook_name)
@@ -3695,15 +3695,15 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
         let hooks = result.get("hooks").unwrap();
 
-        let pre_user_prompt = hooks.get("pre_user_prompt").unwrap().as_array().unwrap();
+        let pre_write_code = hooks.get("pre_write_code").unwrap().as_array().unwrap();
         let post_write_code = hooks.get("post_write_code").unwrap().as_array().unwrap();
 
-        assert_eq!(pre_user_prompt.len(), 2);
+        assert_eq!(pre_write_code.len(), 2);
         assert_eq!(post_write_code.len(), 2);
 
         // Verify original hooks are still there
         assert_eq!(
-            pre_user_prompt[0].get("command").unwrap().as_str().unwrap(),
+            pre_write_code[0].get("command").unwrap().as_str().unwrap(),
             "echo 'before'"
         );
         assert_eq!(
@@ -3722,12 +3722,12 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
 
-        let git_ai_cmd = format!("{} {}", binary_path.display(), WINDSURF_BEFORE_SUBMIT_CMD);
+        let git_ai_cmd = format!("{} {}", binary_path.display(), WINDSURF_BEFORE_EDIT_CMD);
 
         // Create existing hooks file with our command already there
         let existing = json!({
             "hooks": {
-                "pre_user_prompt": [
+                "pre_write_code": [
                     {
                         "command": git_ai_cmd.clone()
                     }
@@ -3749,7 +3749,7 @@ mod tests {
         let content: Value =
             serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
 
-        for hook_name in &["pre_user_prompt", "post_write_code"] {
+        for hook_name in &["pre_write_code", "post_write_code"] {
             let hooks = content.get("hooks").unwrap();
             let hooks_array = hooks.get(*hook_name).unwrap().as_array().unwrap();
 
@@ -3767,7 +3767,7 @@ mod tests {
 
         assert_eq!(
             hooks
-                .get("pre_user_prompt")
+                .get("pre_write_code")
                 .unwrap()
                 .as_array()
                 .unwrap()
@@ -3798,7 +3798,7 @@ mod tests {
         // Create existing hooks file with old command format
         let existing = json!({
             "hooks": {
-                "pre_user_prompt": [
+                "pre_write_code": [
                     {
                         "command": "git-ai checkpoint windsurf 2>/dev/null || true"
                     }
@@ -3817,12 +3817,12 @@ mod tests {
         .unwrap();
 
         // Simulate update logic
-        let git_ai_cmd = format!("{} {}", binary_path.display(), WINDSURF_BEFORE_SUBMIT_CMD);
+        let git_ai_cmd = format!("{} {}", binary_path.display(), WINDSURF_BEFORE_EDIT_CMD);
 
         let mut content: Value =
             serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
 
-        for hook_name in &["pre_user_prompt", "post_write_code"] {
+        for hook_name in &["pre_write_code", "post_write_code"] {
             let hooks_obj = content.get_mut("hooks").unwrap();
             let mut hooks_array = hooks_obj
                 .get(*hook_name)
@@ -3857,15 +3857,15 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
         let hooks = result.get("hooks").unwrap();
 
-        let pre_user_prompt = hooks.get("pre_user_prompt").unwrap().as_array().unwrap();
+        let pre_write_code = hooks.get("pre_write_code").unwrap().as_array().unwrap();
         let post_write_code = hooks.get("post_write_code").unwrap().as_array().unwrap();
 
-        assert_eq!(pre_user_prompt.len(), 1);
+        assert_eq!(pre_write_code.len(), 1);
         assert_eq!(post_write_code.len(), 1);
 
         // Verify commands were updated to new format
         assert_eq!(
-            pre_user_prompt[0].get("command").unwrap().as_str().unwrap(),
+            pre_write_code[0].get("command").unwrap().as_str().unwrap(),
             git_ai_cmd
         );
         assert_eq!(
@@ -3887,7 +3887,7 @@ mod tests {
         // Create existing hooks file with only one hook type
         let existing = json!({
             "hooks": {
-                "pre_user_prompt": [
+                "pre_write_code": [
                     {
                         "command": "echo 'before'"
                     }
@@ -3901,7 +3901,7 @@ mod tests {
         .unwrap();
 
         // Simulate adding missing key
-        let git_ai_cmd = format!("{} {}", binary_path.display(), WINDSURF_BEFORE_SUBMIT_CMD);
+        let git_ai_cmd = format!("{} {}", binary_path.display(), WINDSURF_BEFORE_EDIT_CMD);
 
         let mut content: Value =
             serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
@@ -3915,9 +3915,9 @@ mod tests {
             );
         }
 
-        // Add to pre_user_prompt
+        // Add to pre_write_code
         let mut before_array = hooks_obj
-            .get("pre_user_prompt")
+            .get("pre_write_code")
             .unwrap()
             .as_array()
             .unwrap()
@@ -3926,7 +3926,7 @@ mod tests {
         hooks_obj
             .as_object_mut()
             .unwrap()
-            .insert("pre_user_prompt".to_string(), Value::Array(before_array));
+            .insert("pre_write_code".to_string(), Value::Array(before_array));
 
         fs::write(&hooks_path, serde_json::to_string_pretty(&content).unwrap()).unwrap();
 
@@ -3935,7 +3935,7 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
         let hooks = result.get("hooks").unwrap();
 
-        assert!(hooks.get("pre_user_prompt").is_some());
+        assert!(hooks.get("pre_write_code").is_some());
         assert!(hooks.get("post_write_code").is_some());
 
         let post_write_code = hooks.get("post_write_code").unwrap().as_array().unwrap();
@@ -3974,11 +3974,11 @@ mod tests {
         assert_eq!(existing, json!({}));
 
         // Now create proper structure
-        let git_ai_cmd = format!("{} {}", binary_path.display(), WINDSURF_BEFORE_SUBMIT_CMD);
+        let git_ai_cmd = format!("{} {}", binary_path.display(), WINDSURF_BEFORE_EDIT_CMD);
 
         let result = json!({
             "hooks": {
-                "pre_user_prompt": [
+                "pre_write_code": [
                     {
                         "command": git_ai_cmd.clone()
                     }
@@ -4019,7 +4019,7 @@ mod tests {
         // This test documents and verifies the expected hook names
 
         // Windsurf hook names
-        let windsurf_before = "pre_user_prompt";
+        let windsurf_before = "pre_write_code";
         let windsurf_after = "post_write_code";
 
         // Cursor hook names (for comparison)
