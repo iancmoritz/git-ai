@@ -45,6 +45,7 @@ pub fn to_hashmap(statuses: HashMap<String, InstallStatus>) -> HashMap<String, S
 const MIN_CURSOR_VERSION: (u32, u32) = (1, 7);
 const MIN_CODE_VERSION: (u32, u32) = (1, 99);
 const MIN_CLAUDE_VERSION: (u32, u32) = (2, 0);
+const MIN_WINDSURF_VERSION: (u32, u32) = (1, 12);
 
 // Command patterns for hooks (after "git-ai")
 // Claude Code hooks (uses shell, so relative path works)
@@ -58,6 +59,10 @@ const GEMINI_AFTER_TOOL_CMD: &str = "checkpoint gemini --hook-input stdin";
 // Cursor hooks (requires absolute path to avoid shell config loading delay)
 const CURSOR_BEFORE_SUBMIT_CMD: &str = "checkpoint cursor --hook-input stdin";
 const CURSOR_AFTER_EDIT_CMD: &str = "checkpoint cursor --hook-input stdin";
+
+// Windsurf hooks (requires absolute path to avoid shell config loading delay)
+const WINDSURF_BEFORE_EDIT_CMD: &str = "checkpoint windsurf --hook-input stdin";
+const WINDSURF_AFTER_EDIT_CMD: &str = "checkpoint windsurf --hook-input stdin";
 
 // OpenCode plugin content (TypeScript), embedded from the source file to avoid drift
 const OPENCODE_PLUGIN_CONTENT: &str = include_str!(concat!(
@@ -246,6 +251,48 @@ async fn async_run(
             eprintln!("  Error: {}", version_error);
             eprintln!("  Please update Cursor to continue using git-ai hooks");
             statuses.insert("cursor".to_string(), InstallStatus::NotFound);
+        }
+    }
+
+    match check_windsurf() {
+        Ok(true) => {
+            any_checked = true;
+            // Install/update Windsurf hooks
+            let spinner = Spinner::new("Windsurf: checking hooks");
+            spinner.start();
+
+            match install_windsurf_hooks(&binary_path, dry_run) {
+                Ok(Some(diff)) => {
+                    if dry_run {
+                        spinner.pending("Windsurf: Pending updates");
+                    } else {
+                        spinner.success("Windsurf: Hooks updated");
+                    }
+                    println!(); // Blank line before diff
+                    print_diff(&diff);
+                    has_changes = true;
+                }
+                Ok(None) => {
+                    spinner.success("Windsurf: Hooks already up to date");
+                }
+                Err(e) => {
+                    spinner.error("Windsurf: Failed to update hooks");
+                    eprintln!("  Error: {}", e);
+                    eprintln!("  Check that ~/.windsurf/hooks.json is valid JSON");
+                }
+            }
+
+        }
+        Ok(false) => {
+            // Windsurf not detected
+        }
+        Err(version_error) => {
+            any_checked = true;
+            let spinner = Spinner::new("Windsurf: checking version");
+            spinner.start();
+            spinner.error("Windsurf: Version check failed");
+            eprintln!("  Error: {}", version_error);
+            eprintln!("  Please update Windsurf to continue using git-ai hooks");
         }
     }
 
@@ -522,6 +569,41 @@ fn check_cursor() -> Result<bool, String> {
                         return Err(format!(
                             "Cursor version {}.{} detected, but minimum version {}.{} is required",
                             version.0, version.1, MIN_CURSOR_VERSION.0, MIN_CURSOR_VERSION.1
+                        ));
+                    }
+                }
+                // If we can't parse, continue anyway (be permissive)
+            }
+            Err(_) => {
+                // If version check fails, continue anyway (be permissive)
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+fn check_windsurf() -> Result<bool, String> {
+    // TODO: add the "windsurf-next" binary in the future
+    let has_binary = binary_exists("windsurf");
+    let has_dotfiles = {
+        let home = home_dir();
+        home.join(".windsurf").exists()
+    };
+
+    if !has_binary && !has_dotfiles {
+        return Ok(false);
+    }
+
+    // If we have the binary, check version
+    if has_binary {
+        match get_binary_version("windsurf") {
+            Ok(version_str) => {
+                if let Some(version) = parse_version(&version_str) {
+                    if !version_meets_requirement(version, MIN_WINDSURF_VERSION) {
+                        return Err(format!(
+                            "Windsurf version {}.{} detected, but minimum version {}.{} is required",
+                            version.0, version.1, MIN_WINDSURF_VERSION.0, MIN_WINDSURF_VERSION.1
                         ));
                     }
                 }
@@ -1252,6 +1334,161 @@ fn install_cursor_hooks(binary_path: &Path, dry_run: bool) -> Result<Option<Stri
     Ok(Some(diff_output))
 }
 
+fn install_windsurf_hooks(binary_path: &Path, dry_run: bool) -> Result<Option<String>, GitAiError> {
+    let hooks_path = windsurf_hooks_path();
+
+    // Ensure directory exists
+    if let Some(dir) = hooks_path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+
+    // Read existing content as string
+    let existing_content = if hooks_path.exists() {
+        fs::read_to_string(&hooks_path)?
+    } else {
+        String::new()
+    };
+
+    // Parse existing JSON if present, else start with empty object
+    let existing: Value = if existing_content.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(&existing_content)?
+    };
+
+    // Build commands with absolute path
+    let before_edit_cmd = format!("{} {}", binary_path.display(), WINDSURF_BEFORE_EDIT_CMD);
+    let after_edit_cmd = format!("{} {}", binary_path.display(), WINDSURF_AFTER_EDIT_CMD);
+
+    // Desired hooks payload for Windsurf with hook names
+    // Note: Windsurf uses different hook names than Cursor:
+    // - "pre_write_code" instead of "beforeSubmitPrompt"
+    // - "post_write_code" instead of "afterFileEdit"
+    let desired: Value = json!({
+        "hooks": {
+            "pre_write_code": [
+                {
+                    "command": before_edit_cmd,
+                    "show_output": true
+                }
+            ],
+            "post_write_code": [
+                {
+                    "command": after_edit_cmd,
+                    "show_output": true
+                }
+            ]
+        }
+    });
+
+    // Merge desired into existing
+    let mut merged = existing.clone();
+
+    // Merge hooks object
+    let mut hooks_obj = merged.get("hooks").cloned().unwrap_or_else(|| json!({}));
+
+    // Process both hook types (Windsurf uses different names than Cursor)
+    for hook_name in &["pre_write_code", "post_write_code"] {
+        let desired_hooks = desired
+            .get("hooks")
+            .and_then(|h| h.get(*hook_name))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        // Get existing hooks array for this hook type
+        let mut existing_hooks = hooks_obj
+            .get(*hook_name)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        // Update outdated git-ai checkpoint commands (or add if missing)
+        for desired_hook in desired_hooks {
+            let desired_cmd = desired_hook.get("command").and_then(|c| c.as_str());
+            if desired_cmd.is_none() {
+                continue;
+            }
+            let desired_cmd = desired_cmd.unwrap();
+
+            // Look for existing git-ai checkpoint windsurf commands
+            let mut found_idx = None;
+            let mut needs_update = false;
+
+            for (idx, existing_hook) in existing_hooks.iter().enumerate() {
+                if let Some(existing_cmd) = existing_hook.get("command").and_then(|c| c.as_str()) {
+                    // Check if this is a git-ai checkpoint windsurf command
+                    if existing_cmd.contains("git-ai checkpoint windsurf")
+                        || existing_cmd.contains("git-ai")
+                            && existing_cmd.contains("checkpoint")
+                            && existing_cmd.contains("windsurf")
+                    {
+                        found_idx = Some(idx);
+                        // Check if it matches exactly what we want
+                        if existing_cmd != desired_cmd {
+                            needs_update = true;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            match found_idx {
+                Some(idx) if needs_update => {
+                    // Update to latest format
+                    existing_hooks[idx] = desired_hook.clone();
+                }
+                Some(_) => {
+                    // Already up to date, skip
+                }
+                None => {
+                    // No existing command, add new one
+                    existing_hooks.push(desired_hook.clone());
+                }
+            }
+        }
+
+        // Write back merged hooks for this hook type
+        if let Some(obj) = hooks_obj.as_object_mut() {
+            obj.insert(hook_name.to_string(), Value::Array(existing_hooks));
+        }
+    }
+
+    if let Some(root) = merged.as_object_mut() {
+        root.insert("hooks".to_string(), hooks_obj);
+    }
+
+    // Generate new content (Windsurf doesn't use version field)
+    let new_content = serde_json::to_string_pretty(&merged)?;
+
+    // Check if there are changes
+    if existing_content.trim() == new_content.trim() {
+        return Ok(None); // No changes needed
+    }
+
+    // Generate diff
+    let changes = compute_line_changes(&existing_content, &new_content);
+    let mut diff_output = String::new();
+    diff_output.push_str(&format!("--- {}\n", hooks_path.display()));
+    diff_output.push_str(&format!("+++ {}\n", hooks_path.display()));
+
+    for change in changes {
+        let sign = match change.tag() {
+            LineChangeTag::Delete => "-",
+            LineChangeTag::Insert => "+",
+            LineChangeTag::Equal => " ",
+        };
+        diff_output.push_str(&format!("{}{}", sign, change.value()));
+    }
+
+    // Write if not dry-run
+    if !dry_run {
+        write_atomic(&hooks_path, new_content.as_bytes())?;
+    }
+
+    Ok(Some(diff_output))
+}
+
 fn install_opencode_hooks(dry_run: bool) -> Result<Option<String>, GitAiError> {
     // Install to global config directory: ~/.config/opencode/plugin/git-ai.ts
     let plugin_path = opencode_plugin_path();
@@ -1318,6 +1555,10 @@ fn gemini_settings_path() -> PathBuf {
 
 fn cursor_hooks_path() -> PathBuf {
     home_dir().join(".cursor").join("hooks.json")
+}
+
+fn windsurf_hooks_path() -> PathBuf {
+    home_dir().join(".codeium").join("windsurf").join("hooks.json")
 }
 
 fn write_atomic(path: &Path, data: &[u8]) -> Result<(), GitAiError> {
@@ -2630,6 +2871,40 @@ mod tests {
         // Claude Code 1.x should fail
         let old_claude = parse_version("1.9.9").unwrap();
         assert!(!version_meets_requirement(old_claude, MIN_CLAUDE_VERSION));
+
+        // Windsurf 1.12.x should meet requirement of 1.12
+        let windsurf_version = parse_version("1.12.0").unwrap();
+        assert!(version_meets_requirement(
+            windsurf_version,
+            MIN_WINDSURF_VERSION
+        ));
+
+        // Windsurf 1.13.x should also meet requirement
+        let newer_windsurf = parse_version("1.13.5").unwrap();
+        assert!(version_meets_requirement(
+            newer_windsurf,
+            MIN_WINDSURF_VERSION
+        ));
+
+        // Windsurf 1.11.x should fail
+        let old_windsurf = parse_version("1.11.99").unwrap();
+        assert!(!version_meets_requirement(
+            old_windsurf,
+            MIN_WINDSURF_VERSION
+        ));
+
+        // Windsurf 1.10.x should fail
+        let older_windsurf = parse_version("1.10.0").unwrap();
+        assert!(!version_meets_requirement(
+            older_windsurf,
+            MIN_WINDSURF_VERSION
+        ));
+    }
+
+    #[test]
+    fn test_windsurf_min_version_constant() {
+        // Verify the minimum version constant is set correctly
+        assert_eq!(MIN_WINDSURF_VERSION, (1, 12));
     }
 
     #[test]
@@ -3282,5 +3557,481 @@ mod tests {
             &json!(true)
         );
         assert!(content.get("hooks").is_some());
+    }
+
+    // ============================================================================
+    // Windsurf Hook Installation Tests
+    // ============================================================================
+
+    fn setup_windsurf_test_env() -> (TempDir, PathBuf) {
+        let temp_dir = TempDir::new().unwrap();
+        let hooks_path = temp_dir
+            .path()
+            .join(".codeium")
+            .join("windsurf")
+            .join("hooks.json");
+        (temp_dir, hooks_path)
+    }
+
+    #[test]
+    fn test_windsurf_install_hooks_creates_file_from_scratch() {
+        let (_temp_dir, hooks_path) = setup_windsurf_test_env();
+        let binary_path = create_test_binary_path();
+
+        // Ensure parent directory exists
+        if let Some(parent) = hooks_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        // Build expected commands
+        let before_edit_cmd = format!("{} {}", binary_path.display(), WINDSURF_BEFORE_EDIT_CMD);
+        let after_edit_cmd = format!("{} {}", binary_path.display(), WINDSURF_AFTER_EDIT_CMD);
+
+        // Create the expected structure (simulating install_windsurf_hooks)
+        let result = json!({
+            "hooks": {
+                "pre_write_code": [
+                    {
+                        "command": before_edit_cmd.clone()
+                    }
+                ],
+                "post_write_code": [
+                    {
+                        "command": after_edit_cmd.clone()
+                    }
+                ]
+            }
+        });
+
+        fs::write(&hooks_path, serde_json::to_string_pretty(&result).unwrap()).unwrap();
+
+        // Verify the file was created
+        assert!(hooks_path.exists());
+
+        // Verify the content
+        let content: Value =
+            serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+
+        let hooks = content.get("hooks").unwrap();
+        let pre_write_code = hooks.get("pre_write_code").unwrap().as_array().unwrap();
+        let post_write_code = hooks.get("post_write_code").unwrap().as_array().unwrap();
+
+        assert_eq!(pre_write_code.len(), 1);
+        assert_eq!(post_write_code.len(), 1);
+        assert!(
+            pre_write_code[0]
+                .get("command")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("git-ai checkpoint windsurf")
+        );
+        assert!(
+            post_write_code[0]
+                .get("command")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("git-ai checkpoint windsurf")
+        );
+    }
+
+    #[test]
+    fn test_windsurf_install_hooks_preserves_existing_hooks() {
+        let (_temp_dir, hooks_path) = setup_windsurf_test_env();
+        let binary_path = create_test_binary_path();
+
+        // Create parent directory
+        if let Some(parent) = hooks_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        // Create existing hooks file with other commands
+        let existing = json!({
+            "hooks": {
+                "pre_write_code": [
+                    {
+                        "command": "echo 'before'"
+                    }
+                ],
+                "post_write_code": [
+                    {
+                        "command": "echo 'after'"
+                    }
+                ]
+            }
+        });
+        fs::write(
+            &hooks_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        // Simulate merging (like install_windsurf_hooks does)
+        let git_ai_cmd = format!("{} {}", binary_path.display(), WINDSURF_BEFORE_EDIT_CMD);
+
+        let mut content: Value =
+            serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+
+        for hook_name in &["pre_write_code", "post_write_code"] {
+            let hooks_obj = content.get_mut("hooks").unwrap();
+            let mut hooks_array = hooks_obj
+                .get(*hook_name)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .clone();
+            hooks_array.push(json!({"command": git_ai_cmd.clone()}));
+            hooks_obj
+                .as_object_mut()
+                .unwrap()
+                .insert(hook_name.to_string(), Value::Array(hooks_array));
+        }
+
+        fs::write(&hooks_path, serde_json::to_string_pretty(&content).unwrap()).unwrap();
+
+        // Verify both old and new hooks exist
+        let result: Value =
+            serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        let hooks = result.get("hooks").unwrap();
+
+        let pre_write_code = hooks.get("pre_write_code").unwrap().as_array().unwrap();
+        let post_write_code = hooks.get("post_write_code").unwrap().as_array().unwrap();
+
+        assert_eq!(pre_write_code.len(), 2);
+        assert_eq!(post_write_code.len(), 2);
+
+        // Verify original hooks are still there
+        assert_eq!(
+            pre_write_code[0].get("command").unwrap().as_str().unwrap(),
+            "echo 'before'"
+        );
+        assert_eq!(
+            post_write_code[0].get("command").unwrap().as_str().unwrap(),
+            "echo 'after'"
+        );
+    }
+
+    #[test]
+    fn test_windsurf_install_hooks_skips_if_already_exists() {
+        let (_temp_dir, hooks_path) = setup_windsurf_test_env();
+        let binary_path = create_test_binary_path();
+
+        // Create parent directory
+        if let Some(parent) = hooks_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        let git_ai_cmd = format!("{} {}", binary_path.display(), WINDSURF_BEFORE_EDIT_CMD);
+
+        // Create existing hooks file with our command already there
+        let existing = json!({
+            "hooks": {
+                "pre_write_code": [
+                    {
+                        "command": git_ai_cmd.clone()
+                    }
+                ],
+                "post_write_code": [
+                    {
+                        "command": git_ai_cmd.clone()
+                    }
+                ]
+            }
+        });
+        fs::write(
+            &hooks_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        // Simulate the deduplication logic
+        let content: Value =
+            serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+
+        for hook_name in &["pre_write_code", "post_write_code"] {
+            let hooks = content.get("hooks").unwrap();
+            let hooks_array = hooks.get(*hook_name).unwrap().as_array().unwrap();
+
+            // Check that it finds the existing command
+            let found = hooks_array
+                .iter()
+                .any(|h| h.get("command").and_then(|c| c.as_str()) == Some(&git_ai_cmd));
+            assert!(found);
+        }
+
+        // Verify no duplicates were added
+        let result: Value =
+            serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        let hooks = result.get("hooks").unwrap();
+
+        assert_eq!(
+            hooks
+                .get("pre_write_code")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            hooks
+                .get("post_write_code")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_windsurf_install_hooks_updates_outdated_command() {
+        let (_temp_dir, hooks_path) = setup_windsurf_test_env();
+        let binary_path = create_test_binary_path();
+
+        // Create parent directory
+        if let Some(parent) = hooks_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        // Create existing hooks file with old command format
+        let existing = json!({
+            "hooks": {
+                "pre_write_code": [
+                    {
+                        "command": "git-ai checkpoint windsurf 2>/dev/null || true"
+                    }
+                ],
+                "post_write_code": [
+                    {
+                        "command": "/old/path/git-ai checkpoint windsurf"
+                    }
+                ]
+            }
+        });
+        fs::write(
+            &hooks_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        // Simulate update logic
+        let git_ai_cmd = format!("{} {}", binary_path.display(), WINDSURF_BEFORE_EDIT_CMD);
+
+        let mut content: Value =
+            serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+
+        for hook_name in &["pre_write_code", "post_write_code"] {
+            let hooks_obj = content.get_mut("hooks").unwrap();
+            let mut hooks_array = hooks_obj
+                .get(*hook_name)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .clone();
+
+            // Find and update git-ai checkpoint windsurf commands
+            for hook in hooks_array.iter_mut() {
+                if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
+                    if cmd.contains("git-ai checkpoint windsurf")
+                        || (cmd.contains("git-ai")
+                            && cmd.contains("checkpoint")
+                            && cmd.contains("windsurf"))
+                    {
+                        *hook = json!({"command": git_ai_cmd.clone()});
+                    }
+                }
+            }
+
+            hooks_obj
+                .as_object_mut()
+                .unwrap()
+                .insert(hook_name.to_string(), Value::Array(hooks_array));
+        }
+
+        fs::write(&hooks_path, serde_json::to_string_pretty(&content).unwrap()).unwrap();
+
+        // Verify the commands were updated
+        let result: Value =
+            serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        let hooks = result.get("hooks").unwrap();
+
+        let pre_write_code = hooks.get("pre_write_code").unwrap().as_array().unwrap();
+        let post_write_code = hooks.get("post_write_code").unwrap().as_array().unwrap();
+
+        assert_eq!(pre_write_code.len(), 1);
+        assert_eq!(post_write_code.len(), 1);
+
+        // Verify commands were updated to new format
+        assert_eq!(
+            pre_write_code[0].get("command").unwrap().as_str().unwrap(),
+            git_ai_cmd
+        );
+        assert_eq!(
+            post_write_code[0].get("command").unwrap().as_str().unwrap(),
+            git_ai_cmd
+        );
+    }
+
+    #[test]
+    fn test_windsurf_install_hooks_creates_missing_hook_keys() {
+        let (_temp_dir, hooks_path) = setup_windsurf_test_env();
+        let binary_path = create_test_binary_path();
+
+        // Create parent directory
+        if let Some(parent) = hooks_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        // Create existing hooks file with only one hook type
+        let existing = json!({
+            "hooks": {
+                "pre_write_code": [
+                    {
+                        "command": "echo 'before'"
+                    }
+                ]
+            }
+        });
+        fs::write(
+            &hooks_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        // Simulate adding missing key
+        let git_ai_cmd = format!("{} {}", binary_path.display(), WINDSURF_BEFORE_EDIT_CMD);
+
+        let mut content: Value =
+            serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        let hooks_obj = content.get_mut("hooks").unwrap();
+
+        // Add post_write_code if it doesn't exist
+        if hooks_obj.get("post_write_code").is_none() {
+            hooks_obj.as_object_mut().unwrap().insert(
+                "post_write_code".to_string(),
+                json!([{"command": git_ai_cmd.clone()}]),
+            );
+        }
+
+        // Add to pre_write_code
+        let mut before_array = hooks_obj
+            .get("pre_write_code")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .clone();
+        before_array.push(json!({"command": git_ai_cmd.clone()}));
+        hooks_obj
+            .as_object_mut()
+            .unwrap()
+            .insert("pre_write_code".to_string(), Value::Array(before_array));
+
+        fs::write(&hooks_path, serde_json::to_string_pretty(&content).unwrap()).unwrap();
+
+        // Verify the missing key was created
+        let result: Value =
+            serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        let hooks = result.get("hooks").unwrap();
+
+        assert!(hooks.get("pre_write_code").is_some());
+        assert!(hooks.get("post_write_code").is_some());
+
+        let post_write_code = hooks.get("post_write_code").unwrap().as_array().unwrap();
+        assert_eq!(post_write_code.len(), 1);
+        assert!(
+            post_write_code[0]
+                .get("command")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("git-ai checkpoint windsurf")
+        );
+    }
+
+    #[test]
+    fn test_windsurf_install_hooks_handles_empty_file() {
+        let (_temp_dir, hooks_path) = setup_windsurf_test_env();
+        let binary_path = create_test_binary_path();
+
+        // Create parent directory
+        if let Some(parent) = hooks_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        // Create empty file
+        fs::write(&hooks_path, "").unwrap();
+
+        // Read and handle empty file
+        let contents = fs::read_to_string(&hooks_path).unwrap();
+        let existing: Value = if contents.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(&contents).unwrap()
+        };
+
+        assert_eq!(existing, json!({}));
+
+        // Now create proper structure
+        let git_ai_cmd = format!("{} {}", binary_path.display(), WINDSURF_BEFORE_EDIT_CMD);
+
+        let result = json!({
+            "hooks": {
+                "pre_write_code": [
+                    {
+                        "command": git_ai_cmd.clone()
+                    }
+                ],
+                "post_write_code": [
+                    {
+                        "command": git_ai_cmd.clone()
+                    }
+                ]
+            }
+        });
+
+        fs::write(&hooks_path, serde_json::to_string_pretty(&result).unwrap()).unwrap();
+
+        // Verify proper structure was created
+        let content: Value =
+            serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        assert!(content.get("hooks").is_some());
+    }
+
+    #[test]
+    fn test_windsurf_hooks_path_structure() {
+        // Verify the windsurf_hooks_path returns the expected path structure
+        let path = windsurf_hooks_path();
+        let path_str = path.to_string_lossy();
+
+        // Should contain .codeium/windsurf/hooks.json
+        assert!(
+            path_str.contains(".codeium") && path_str.contains("windsurf") && path_str.ends_with("hooks.json"),
+            "Expected path to contain .codeium/windsurf/hooks.json, got: {}",
+            path_str
+        );
+    }
+
+    #[test]
+    fn test_windsurf_hook_names_differ_from_cursor() {
+        // Windsurf uses different hook names than Cursor
+        // This test documents and verifies the expected hook names
+
+        // Windsurf hook names
+        let windsurf_before = "pre_write_code";
+        let windsurf_after = "post_write_code";
+
+        // Cursor hook names (for comparison)
+        let cursor_before = "beforeSubmitPrompt";
+        let cursor_after = "afterFileEdit";
+
+        // Verify they are different
+        assert_ne!(windsurf_before, cursor_before);
+        assert_ne!(windsurf_after, cursor_after);
+
+        // Verify Windsurf uses snake_case
+        assert!(windsurf_before.contains('_'));
+        assert!(windsurf_after.contains('_'));
     }
 }

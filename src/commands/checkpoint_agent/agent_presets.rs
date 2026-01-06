@@ -1057,6 +1057,114 @@ impl CursorPreset {
     }
 }
 
+// Windsurf to checkpoint preset
+pub struct WindsurfPreset;
+
+impl AgentCheckpointPreset for WindsurfPreset {
+    fn run(&self, flags: AgentCheckpointFlags) -> Result<AgentRunResult, GitAiError> {
+        // Parse hook_input JSON
+        // Windsurf hook data general fields (https://docs.windsurf.com/windsurf/cascade/hooks#common-input-structure)
+        // {
+        //   "agent_action_name": "string",
+        //   "trajectory_id": "string",
+        //   "execution_id": "string",
+        //   "timestamp": "string",
+        //   "tool_info": {...} (depends on agent_action_name)
+        // }
+        let hook_input_json = flags.hook_input.ok_or_else(|| {
+            GitAiError::PresetError("hook_input is required for Windsurf preset".to_string())
+        })?;
+
+        let hook_data: serde_json::Value = serde_json::from_str(&hook_input_json)
+            .map_err(|e| GitAiError::PresetError(format!("Invalid JSON in hook_input: {}", e)))?;
+
+        // Extract trajectory_id from the JSON
+        // Note: Windsurf uses "trajectory" terminology instead of "conversation"
+        let trajectory_id = hook_data
+            .get("trajectory_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                GitAiError::PresetError("trajectory_id not found in hook_input".to_string())
+            })?
+            .to_string();
+
+        // Extract agent_action_name (Windsurf's equivalent of hook_event_name)
+        let agent_action_name = hook_data
+            .get("agent_action_name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                GitAiError::PresetError("agent_action_name not found in hook_input".to_string())
+            })?
+            .to_string();
+
+        // Windsurf does not provide model in hook data
+        // For now, use "unknown" as placeholder
+        let model = "unknown".to_string();
+
+        // Validate agent_action_name
+        // Note: Windsurf uses different action names than Cursor:
+        // - "pre_write_code" for before file edit (human checkpoint)
+        // - "post_write_code" for after file edit (AI checkpoint)
+        if agent_action_name != "pre_write_code" && agent_action_name != "post_write_code" {
+            return Err(GitAiError::PresetError(format!(
+                "Invalid agent_action_name: {}. Expected 'pre_write_code' or 'post_write_code'",
+                agent_action_name
+            )));
+        }
+
+        // Windsurf does not provide workspace_roots - use None and let caller determine from git context
+        let repo_working_dir: Option<String> = None;
+
+        // Extract filepath from tool_info.file_path (used for both will_edit and edited)
+        let filepath = hook_data
+            .get("tool_info")
+            .and_then(|ti| ti.get("file_path"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        let agent_id = AgentId {
+            tool: "windsurf".to_string(),
+            id: trajectory_id,
+            model,
+        };
+
+        if agent_action_name == "pre_write_code" {
+            return Ok(AgentRunResult {
+                agent_id,
+                agent_metadata: None,
+                checkpoint_kind: CheckpointKind::Human,
+                transcript: None,
+                repo_working_dir,
+                edited_filepaths: None,
+                will_edit_filepaths: filepath.map(|f| vec![f]),
+                dirty_files: None,
+            });
+        }
+
+        return Ok(AgentRunResult {
+            agent_id,
+            agent_metadata: None,
+            checkpoint_kind: CheckpointKind::AiAgent,
+            transcript: None,
+            repo_working_dir,
+            edited_filepaths: filepath.map(|f| vec![f]),
+            will_edit_filepaths: None,
+            dirty_files: None,
+        })
+    }
+}
+
+impl WindsurfPreset {
+    /// Fetch the latest version of a Windsurf trajectory from the database
+    pub fn fetch_latest_windsurf_trajectory(
+        _trajectory_id: &str,
+    ) -> Result<Option<(AiTranscript, String)>, GitAiError> {
+        // TODO: Not implemented
+        Ok(None)
+    }
+}
+
 pub struct GithubCopilotPreset;
 
 impl AgentCheckpointPreset for GithubCopilotPreset {
@@ -1561,5 +1669,250 @@ impl AgentCheckpointPreset for AiTabPreset {
             will_edit_filepaths: None,
             dirty_files,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ============================================================================
+    // WindsurfPreset Tests
+    // ============================================================================
+
+    fn create_windsurf_hook_input(
+        agent_action_name: &str,
+        trajectory_id: &str,
+        tool_info: Option<serde_json::Value>,
+    ) -> String {
+        let mut json = serde_json::json!({
+            "agent_action_name": agent_action_name,
+            "trajectory_id": trajectory_id,
+            "execution_id": "exec-123",
+            "timestamp": "2025-01-05T12:00:00Z"
+        });
+        if let Some(ti) = tool_info {
+            json.as_object_mut().unwrap().insert("tool_info".to_string(), ti);
+        }
+        serde_json::to_string(&json).unwrap()
+    }
+
+    #[test]
+    fn test_windsurf_pre_write_code_returns_human_checkpoint() {
+        let hook_input = create_windsurf_hook_input("pre_write_code", "traj-abc-123", None);
+        let flags = AgentCheckpointFlags {
+            hook_input: Some(hook_input),
+        };
+
+        let result = WindsurfPreset.run(flags).unwrap();
+
+        assert_eq!(result.checkpoint_kind, CheckpointKind::Human);
+        assert_eq!(result.agent_id.tool, "windsurf");
+        assert_eq!(result.agent_id.id, "traj-abc-123");
+        assert!(result.transcript.is_none());
+        assert!(result.repo_working_dir.is_none());
+    }
+
+    #[test]
+    fn test_windsurf_missing_hook_input_errors() {
+        let flags = AgentCheckpointFlags { hook_input: None };
+
+        let result = WindsurfPreset.run(flags);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("hook_input is required"),
+            "Expected 'hook_input is required' error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_windsurf_invalid_json_errors() {
+        let flags = AgentCheckpointFlags {
+            hook_input: Some("not valid json".to_string()),
+        };
+
+        let result = WindsurfPreset.run(flags);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid JSON"),
+            "Expected 'Invalid JSON' error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_windsurf_missing_trajectory_id_errors() {
+        let hook_input = serde_json::json!({
+            "agent_action_name": "pre_write_code",
+            "execution_id": "exec-123"
+        })
+        .to_string();
+
+        let flags = AgentCheckpointFlags {
+            hook_input: Some(hook_input),
+        };
+
+        let result = WindsurfPreset.run(flags);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("trajectory_id not found"),
+            "Expected 'trajectory_id not found' error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_windsurf_missing_agent_action_name_errors() {
+        let hook_input = serde_json::json!({
+            "trajectory_id": "traj-abc-123",
+            "execution_id": "exec-123"
+        })
+        .to_string();
+
+        let flags = AgentCheckpointFlags {
+            hook_input: Some(hook_input),
+        };
+
+        let result = WindsurfPreset.run(flags);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("agent_action_name not found"),
+            "Expected 'agent_action_name not found' error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_windsurf_invalid_agent_action_name_errors() {
+        let hook_input = serde_json::json!({
+            "agent_action_name": "invalid_action",
+            "trajectory_id": "traj-abc-123",
+            "execution_id": "exec-123"
+        })
+        .to_string();
+
+        let flags = AgentCheckpointFlags {
+            hook_input: Some(hook_input),
+        };
+
+        let result = WindsurfPreset.run(flags);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid agent_action_name"),
+            "Expected 'Invalid agent_action_name' error, got: {}",
+            err
+        );
+        assert!(
+            err.to_string()
+                .contains("Expected 'pre_write_code' or 'post_write_code'"),
+            "Expected hint about valid values, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_windsurf_pre_write_code_extracts_will_edit_filepaths() {
+        let hook_input = create_windsurf_hook_input(
+            "pre_write_code",
+            "traj-abc-123",
+            Some(serde_json::json!({
+                "file_path": "/src/main.rs",
+                "edits": [
+                    {
+                        "old_string": "fn old()",
+                        "new_string": "fn new()"
+                    }
+                ]
+            })),
+        );
+        let flags = AgentCheckpointFlags {
+            hook_input: Some(hook_input),
+        };
+
+        let result = WindsurfPreset.run(flags).unwrap();
+
+        assert_eq!(result.checkpoint_kind, CheckpointKind::Human);
+        assert_eq!(
+            result.will_edit_filepaths,
+            Some(vec!["/src/main.rs".to_string()])
+        );
+        assert!(result.dirty_files.is_none());
+    }
+
+    #[test]
+    fn test_windsurf_pre_write_code_multiple_edits() {
+        let hook_input = create_windsurf_hook_input(
+            "pre_write_code",
+            "traj-abc-123",
+            Some(serde_json::json!({
+                "file_path": "/src/lib.rs",
+                "edits": [
+                    {"old_string": "a", "new_string": "first"},
+                    {"old_string": "b", "new_string": "second"}
+                ]
+            })),
+        );
+        let flags = AgentCheckpointFlags {
+            hook_input: Some(hook_input),
+        };
+
+        let result = WindsurfPreset.run(flags).unwrap();
+
+        assert_eq!(result.checkpoint_kind, CheckpointKind::Human);
+        assert_eq!(
+            result.will_edit_filepaths,
+            Some(vec!["/src/lib.rs".to_string()])
+        );
+        assert!(result.dirty_files.is_none());
+    }
+
+    #[test]
+    fn test_windsurf_post_write_code_returns_ai_agent_checkpoint() {
+        let hook_input = create_windsurf_hook_input(
+            "post_write_code",
+            "traj-abc-123",
+            Some(serde_json::json!({"file_path": "/path/to/edited/file.rs"})),
+        );
+        let flags = AgentCheckpointFlags {
+            hook_input: Some(hook_input),
+        };
+
+        let result = WindsurfPreset.run(flags).unwrap();
+
+        assert_eq!(result.checkpoint_kind, CheckpointKind::AiAgent);
+        assert_eq!(result.agent_id.tool, "windsurf");
+        assert_eq!(result.agent_id.id, "traj-abc-123");
+        assert_eq!(
+            result.edited_filepaths,
+            Some(vec!["/path/to/edited/file.rs".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_windsurf_post_write_code_empty_file_path_not_added() {
+        let hook_input = create_windsurf_hook_input(
+            "post_write_code",
+            "traj-abc-123",
+            Some(serde_json::json!({"file_path": ""})),
+        );
+        let flags = AgentCheckpointFlags {
+            hook_input: Some(hook_input),
+        };
+
+        let result = WindsurfPreset.run(flags).unwrap();
+
+        assert_eq!(result.checkpoint_kind, CheckpointKind::AiAgent);
+        assert!(result.edited_filepaths.is_none());
     }
 }
