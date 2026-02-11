@@ -5,6 +5,7 @@ use crate::authorship::secrets::{redact_secrets_from_prompts, strip_prompt_messa
 use crate::authorship::stats::{stats_for_commit_stats, write_stats_to_terminal};
 use crate::authorship::virtual_attribution::VirtualAttributions;
 use crate::authorship::working_log::{Checkpoint, CheckpointKind};
+use crate::commands::checkpoint_agent::agent_presets::WindsurfPreset;
 use crate::config::Config;
 use crate::error::GitAiError;
 use crate::git::refs::notes_add;
@@ -242,13 +243,24 @@ fn update_prompts_to_latest(checkpoints: &mut [Checkpoint]) -> Result<(), GitAiE
         let checkpoint = &checkpoints[last_idx];
 
         if let Some(agent_id) = &checkpoint.agent_id {
-            // Use shared update logic from prompt_updater module
-            let result = update_prompt_from_tool(
-                &agent_id.tool,
-                &agent_id.id,
-                checkpoint.agent_metadata.as_ref(),
-                &agent_id.model,
-            );
+            // Use shared update logic from prompt_updater module for most tools
+            // Windsurf has special handling here since it's not in the shared module yet
+            let result = if agent_id.tool == "windsurf" {
+                match WindsurfPreset::fetch_latest_windsurf_trajectory(&agent_id.id) {
+                    Ok(Some((latest_transcript, latest_model))) => {
+                        PromptUpdateResult::Updated(latest_transcript, latest_model)
+                    }
+                    Ok(None) => PromptUpdateResult::Unchanged,
+                    Err(e) => PromptUpdateResult::Failed(e),
+                }
+            } else {
+                update_prompt_from_tool(
+                    &agent_id.tool,
+                    &agent_id.id,
+                    checkpoint.agent_metadata.as_ref(),
+                    &agent_id.model,
+                )
+            };
 
             // Apply the update to the last checkpoint only
             match result {
